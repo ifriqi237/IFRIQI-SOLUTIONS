@@ -2,9 +2,16 @@
   "name": "ifriqi-solutions",
   "version": "1.0.0",
   "private": true,
-  "description": "IFRIQI — carte QR d'identification et d'urgence. Prototype SaaS en une seule page HTML/JS (ifriqi.html), avec un backend Supabase audité (ifriqi-backend/).",
+  "description": "IFRIQI — carte QR d'identification et d'urgence. Prototype SaaS en une seule page HTML/JS (ifriqi.html), servi par un petit serveur Express, avec un backend Supabase audité (ifriqi-backend/).",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "npx serve . -l 3000"
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
   },
   "repository": {
     "type": "git",

@@ -534,7 +534,15 @@ function fontForLang(lang){return lang==='ar' ? "'Noto Naskh Arabic','Noto Sans 
 function headFontForLang(lang){return lang==='ar' ? "'Noto Naskh Arabic','Noto Sans Arabic','Segoe UI',Tahoma,Arial,sans-serif" : FH}
 function tf(k,vars){let s=t(k);if(vars)Object.keys(vars).forEach(vk=>{s=s.split('{'+vk+'}').join(vars[vk])});return s}
 function setLang(l){LANG=l;try{localStorage.setItem('ifriqi_lang',l)}catch(e){}closeLangMenu();render()}
-function toggleLangMenu(e){e.stopPropagation();const m=$('#langm');if(!m)return;const willOpen=!m.classList.contains('open');closeLangMenu();if(willOpen){m.classList.add('open');const b=$('#lgb');if(b)b.setAttribute('aria-expanded','true')}}
+function toggleLangMenu(e){e.stopPropagation();const m=$('#langm');if(!m)return;const willOpen=!m.classList.contains('open');closeLangMenu();if(willOpen){m.classList.add('open');
+  // Correctif (rapport, 9 oct. 2026) : le panneau est ancré en "right:0" par rapport à son
+  // propre bouton (.dd), qui n'est plus forcément proche du bord droit de l'écran depuis la
+  // réorganisation de la barre de menus — sur un petit écran Android il partait hors-écran à
+  // gauche. Même correction d'overflow que pour le menu "Dashboard" (toggleDD ci-dessous) :
+  // on mesure sa position réelle et on bascule à gauche si besoin.
+  m.style.left='';m.style.right='0';const r=m.getBoundingClientRect();
+  if(r.left<8){m.style.right='auto';m.style.left='0'}
+  const b=$('#lgb');if(b)b.setAttribute('aria-expanded','true')}}
 function closeLangMenu(){const m=$('#langm');if(m)m.classList.remove('open');const b=$('#lgb');if(b)b.setAttribute('aria-expanded','false')}
 const FLAGSVG={
  FR:'<rect width="20" height="14" fill="#ED2939"/><rect width="13.33" height="14" fill="#fff"/><rect width="6.66" height="14" fill="#002395"/>',

@@ -35,12 +35,35 @@ button,input,select,textarea{font:inherit;color:inherit}
 .wrap{max-width:1040px;margin:0 auto;padding:0 18px}
 .narrow{max-width:640px;margin:0 auto;padding:0 18px}
 header.top{background:#fff;color:#012768;position:sticky;top:0;z-index:20;padding-top:env(safe-area-inset-top,0px);border-bottom:3px solid #FE4E9A}
-header.top .wrap{display:flex;align-items:center;gap:14px;height:72px}
-.logo{display:flex;align-items:center;text-decoration:none}
+/* F-14 (rapport, 9 oct. 2026) : .wrap avait une hauteur FIXE (height:72px) alors que .nav
+   pouvait passer sur 2 lignes (flex-wrap) dès que plusieurs commandes étaient visibles
+   (sélecteur de langue + lien + menu tableau de bord + déconnexion) — sur un écran Android
+   étroit, la 2e ligne était coupée/invisible au lieu de repousser la hauteur du bandeau.
+   On passe en min-height + padding vertical : le bandeau grandit proprement quand ça wrap. */
+header.top .wrap{display:flex;align-items:center;flex-wrap:wrap;gap:8px 14px;min-height:72px;padding-top:9px;padding-bottom:9px}
+.logo{display:flex;align-items:center;text-decoration:none;flex:0 0 auto}
 .logo img{height:54px;width:auto;display:block}
-header.top nav{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
-header.top nav a,header.top nav button{color:#012768;text-decoration:none;background:none;border:0;padding:8px 10px;border-radius:8px;cursor:pointer;font-weight:600;font-size:.95rem}
+header.top nav{margin-inline-start:auto;display:flex;align-items:center;gap:2px 4px;flex-wrap:wrap;justify-content:flex-end;max-width:100%}
+header.top nav a,header.top nav button{color:#012768;text-decoration:none;background:none;border:0;padding:9px 12px;border-radius:8px;cursor:pointer;font-weight:600;font-size:.92rem;white-space:nowrap;line-height:1.25}
 header.top nav a:hover,header.top nav button:hover{background:rgba(11,50,115,.09)}
+/* Hiérarchie visuelle des commandes : l'action principale (connexion / tableau de bord) est
+   un bouton plein, clairement la plus visible ; la déconnexion est un bouton "ghost" contouré
+   pour qu'on ne la confonde pas avec un simple lien de navigation. */
+header.top nav .navcta{background:var(--cta);color:var(--cta-ink);border-radius:999px;padding:9px 18px}
+header.top nav .navcta:hover{background:var(--cta);filter:brightness(.94)}
+header.top nav .navghost{border:1.5px solid rgba(1,39,104,.28);border-radius:999px;padding:7.5px 16px}
+header.top nav .navghost:hover{background:rgba(11,50,115,.06)}
+@media(max-width:640px){
+  header.top nav{width:100%;justify-content:flex-end;gap:2px}
+  header.top nav a,header.top nav button{padding:8px 10px;font-size:.86rem}
+  header.top nav .navcta{padding:8px 16px}
+  header.top nav .navghost{padding:6.5px 14px}
+}
+@media(max-width:380px){
+  header.top .wrap{gap:6px 10px}
+  header.top nav a,header.top nav button{padding:7px 8px;font-size:.8rem}
+  header.top nav .navcta{padding:7px 13px}
+}
 main{padding:28px 0 60px;min-height:70vh}
 main:not(.home){position:relative;isolation:isolate}
 main:not(.home)::before{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;
@@ -168,7 +191,7 @@ table{width:100%;border-collapse:collapse;font-size:.9rem} th,td{text-align:left
 .blur{display:inline-block;filter:blur(5px);user-select:none}
 .cw img{width:100%;height:100%;display:block}
 .dd{position:relative}
-.ddm{display:none;position:absolute;right:0;top:calc(100% + 6px);background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 30px rgba(11,31,63,.2);min-width:190px;padding:6px;z-index:40}
+.ddm{display:none;position:absolute;inset-inline-end:0;top:calc(100% + 6px);background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 30px rgba(11,31,63,.2);min-width:190px;max-width:calc(100vw - 24px);padding:6px;z-index:40}
 .flagicon{display:inline-flex;flex:none;border-radius:2px;overflow:hidden;box-shadow:0 0 0 1px rgba(0,0,0,.12);line-height:0}
 .flagicon svg{display:block}
 .langbtn{background:none;border:0;color:#012768;font-weight:600;cursor:pointer;padding:8px 10px;border-radius:8px;font-size:.95rem;display:flex;align-items:center;gap:6px}
@@ -797,7 +820,7 @@ function goBack(){const prev=navStack.pop();go(prev?prev.replace(/^#/,''):'/')}
 function shell(inner,home){
   const u=me();
   return `<header class="top"><div class="wrap"><a class="logo" href="#/"><img src="${LOGO_URI}" alt="ifriqi"></a><nav aria-label="${t('g_nav_aria')}">
-  ${langHtml()}${myDist()?'':`<a href="#/programme">${t('nav_recommend')}</a>`}${u?`${myDist()?`<div class="dd"><button id="ddb" onclick="toggleDD(event)" aria-haspopup="true" aria-expanded="false">${t('nav_dashboard')} ▾</button><div class="ddm" id="ddm"><a href="#/app">${t('nav_myspace')}</a><a href="#/distrib">${t('nav_distributor')}</a></div></div>`:`<a href="#/app">${t('nav_dashboard')}</a>`}<button onclick="logout()">${t('nav_logout')}</button>`:`<a href="#/auth">${t('nav_login')}</a>`}</nav></div></header>
+  ${langHtml()}${myDist()?'':`<a href="#/programme">${t('nav_recommend')}</a>`}${u?`${myDist()?`<div class="dd"><button id="ddb" class="navcta" onclick="toggleDD(event)" aria-haspopup="true" aria-expanded="false">${t('nav_dashboard')} ▾</button><div class="ddm" id="ddm"><a href="#/app">${t('nav_myspace')}</a><a href="#/distrib">${t('nav_distributor')}</a></div></div>`:`<a class="navcta" href="#/app">${t('nav_dashboard')}</a>`}<button class="navghost" onclick="logout()">${t('nav_logout')}</button>`:`<a class="navcta" href="#/auth">${t('nav_login')}</a>`}</nav></div></header>
   <main class="${home?'home':''}">${home?'':`<div class="backbar wrap"><button class="backbtn" onclick="goBack()">← ${t('back')}</button></div>`}${inner}</main>
   <footer class="foot"><div class="wrap"><div class="fg">
    <div><span class="lchip"><img src="${LOGO_URI}" alt="ifriqi"></span><p>${t('footer_tagline')}</p></div>

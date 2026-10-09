@@ -1,4 +1,6 @@
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+// F-13 (audit pré-prod) : version figée explicitement, comme dans
+// frontend-integration/supabase-client.js — jamais "@2" flottant.
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
 // Client "service_role" : utilisé UNIQUEMENT à l'intérieur des Edge Functions, jamais exposé
 // au navigateur. Il contourne RLS par conception — c'est lui qui a le droit d'écrire dans

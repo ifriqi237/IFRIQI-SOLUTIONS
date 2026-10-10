@@ -103,6 +103,73 @@ export async function initiateDeposit(params: PawaPayDepositParams): Promise<Paw
 }
 
 // ---------------------------------------------------------------------------
+// Initiation d'un remboursement — POST /v2/refunds.
+// Référence (consultée le 2026-10-10) : https://docs.pawapay.io/v2/api-reference/refunds/initiate-refund
+//
+// Comme pour initiateDeposit(), `refundId` est TOUJOURS généré côté serveur (jamais fourni par
+// le client ni par un panneau d'administration sans contrôle) : c'est l'identifiant idempotent
+// PawaPay, et c'est aussi la valeur stockée dans payments.refund_ref, protégée par l'index
+// unique (refund_provider, refund_ref) où refund_ref is not null (0003_pawapay.sql). L'appelant
+// (refund-order/index.ts) doit en outre réserver cette valeur en base de façon atomique AVANT
+// d'appeler cette fonction, pour qu'un double clic ou deux requêtes admin concurrentes ne
+// déclenchent jamais deux remboursements pour le même paiement.
+//
+// Idempotence documentée par PawaPay : renvoyer deux fois le même refundId est sûr — la 2e
+// tentative revient avec status="DUPLICATE_IGNORED" et aucun nouveau callback n'est émis.
+// ---------------------------------------------------------------------------
+
+export type PawaPayRefundParams = {
+  refundId: string;            // UUID v4 généré côté serveur, jamais fourni par le client
+  depositId: string;           // depositId PawaPay du dépôt à rembourser (= payments.provider_ref)
+  amount: string;               // montant à rembourser, en chaîne (ex. "500"), jamais un flottant
+  currency: string;             // ISO 4217 — doit correspondre à la devise du dépôt d'origine
+  clientReferenceId?: string;   // ex. l'id de la commande IFRIQI, pour rapprochement
+};
+
+export type PawaPayRefundResult =
+  | { ok: true; status: "ACCEPTED"; refundId: string; created?: string; raw: unknown }
+  | { ok: false; status: "REJECTED" | "DUPLICATE_IGNORED" | "HTTP_ERROR"; failureCode?: string; failureMessage?: string; raw: unknown };
+
+export async function initiateRefund(params: PawaPayRefundParams): Promise<PawaPayRefundResult> {
+  const body = {
+    refundId: params.refundId,
+    depositId: params.depositId,
+    amount: params.amount,
+    currency: params.currency,
+    ...(params.clientReferenceId ? { clientReferenceId: params.clientReferenceId } : {}),
+  };
+
+  const res = await fetch(`${pawapayApiBase()}/v2/refunds`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...pawapayAuthHeaders() },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    console.error("PawaPay initiateRefund HTTP error", res.status, data);
+    return {
+      ok: false,
+      status: "HTTP_ERROR",
+      failureCode: data?.failureReason?.failureCode,
+      failureMessage: data?.failureReason?.failureMessage,
+      raw: data,
+    };
+  }
+
+  if (data?.status === "ACCEPTED") {
+    return { ok: true, status: "ACCEPTED", refundId: data.refundId ?? params.refundId, created: data.created, raw: data };
+  }
+  return {
+    ok: false,
+    status: data?.status ?? "REJECTED",
+    failureCode: data?.failureReason?.failureCode,
+    failureMessage: data?.failureReason?.failureMessage,
+    raw: data,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // GET /v2/active-conf — liste des pays/fournisseurs/devises actuellement actifs chez PawaPay.
 // Utilisé pour valider côté serveur qu'un code `provider` envoyé par le front (ex.
 // "MTN_MOMO_BEN") existe réellement et accepte des DEPOSIT dans la devise demandée, avant

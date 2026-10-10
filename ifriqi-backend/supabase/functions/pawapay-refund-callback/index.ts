@@ -23,7 +23,7 @@ Deno.serve(async (req) => {
   try {
     const requireSignature = Deno.env.get("PAWAPAY_REQUIRE_SIGNATURE") !== "false";
     if (requireSignature) {
-      const verif = await verifyPawaPayCallback(req, rawBody);
+      const verif = await verifyPawaPayCallback(req, rawBody, "/functions/v1/pawapay-refund-callback");
       if (!verif.ok) {
         console.error("pawapay-refund-callback: signature invalide", verif.reason);
         return json({ error: "Signature invalide." }, 401);

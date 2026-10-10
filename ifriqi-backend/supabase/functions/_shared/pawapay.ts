@@ -409,7 +409,18 @@ export type SignatureVerification = { ok: boolean; reason?: string };
 // Vérifie l'intégrité (Content-Digest) ET l'authenticité (Signature) d'un callback PawaPay.
 // `rawBody` doit être le corps BRUT de la requête, exactement comme reçu (avant tout
 // JSON.parse), car le digest et la signature portent sur ces octets précis.
-export async function verifyPawaPayCallback(req: Request, rawBody: Uint8Array): Promise<SignatureVerification> {
+//
+// `expectedPath` : chemin PUBLIC réel sur lequel PawaPay appelle ce callback (celui configuré
+// dans leur Dashboard, ex. "/functions/v1/pawapay-deposit-callback"). Indispensable : le runtime
+// Edge Functions de Supabase réécrit `req.url` en interne en retirant le préfixe
+// "/functions/v1/<slug>" avant que le handler ne le voie (confirmé par log le 2026-10-10 : PawaPay
+// signe le chemin complet "/functions/v1/pawapay-deposit-callback", mais `new URL(req.url).pathname`
+// ne renvoyait ici que "/pawapay-deposit-callback"). Reconstruire le composant "@path" de la base de
+// signature à partir de `req.url` donnait donc TOUJOURS un chemin différent de celui réellement
+// signé par PawaPay, donc une signature "invalide" à chaque callback réel, quel que soit le jeton
+// ou la clé. Chaque fonction de callback doit donc passer son propre chemin public connu, plutôt
+// que de le déduire de la requête reçue.
+export async function verifyPawaPayCallback(req: Request, rawBody: Uint8Array, expectedPath: string): Promise<SignatureVerification> {
   const sigHeader = req.headers.get("signature");
   const sigInputHeader = req.headers.get("signature-input");
   const digestHeader = req.headers.get("content-digest");
@@ -438,7 +449,7 @@ export async function verifyPawaPayCallback(req: Request, rawBody: Uint8Array): 
     switch (comp) {
       case "@method": value = req.method.toUpperCase(); break;
       case "@authority": value = new URL(req.url).host.toLowerCase(); break;
-      case "@path": value = new URL(req.url).pathname; break;
+      case "@path": value = expectedPath; break;
       case "signature-date": value = dateHeader; break;
       case "content-digest": value = digestHeader; break;
       case "content-type": value = contentType; break;

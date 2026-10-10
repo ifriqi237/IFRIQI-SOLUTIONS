@@ -264,7 +264,18 @@ export async function getActiveConfiguration(country?: string, operationType: st
 }
 
 function pawapayAuthHeaders(): Record<string, string> {
-  const token = Deno.env.get("PAWAPAY_API_TOKEN");
+  const raw = Deno.env.get("PAWAPAY_API_TOKEN");
+  if (!raw) return {};
+  // F-14 (incident) : le jeton collé dans Project Settings → Edge Functions → Secrets contenait
+  // au moins un caractère hors de la plage ASCII imprimable (espace insécable, guillemet
+  // typographique, tiret long, etc. — invisible à l'oeil mais introduit par un copier-coller
+  // depuis une page web ou un traitement de texte). `fetch` refuse alors de construire l'en-tête
+  // Authorization ("Failed to construct 'Request': ... is not a valid ByteString"), ce qui faisait
+  // échouer silencieusement TOUS les appels sortants vers PawaPay (dépôts, retraits, remboursements
+  // ET la liste des opérateurs), bien avant même d'atteindre leur serveur. Un jeton PawaPay valide
+  // (JWT) ne contient que des lettres, chiffres, points, tirets et underscores : on ne garde que
+  // ces caractères pour éliminer la casse sans risquer de corrompre un jeton par ailleurs correct.
+  const token = raw.trim().replace(/[^A-Za-z0-9._-]/g, "");
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 

@@ -10,6 +10,9 @@
 //      statut réel auprès de l'API PawaPay (Check Deposit Status) avant d'écrire en base.
 //   3. Idempotence : index unique payments(provider, provider_ref) où status='SUCCESS'
 //      (0001_init.sql) — rejouer ce callback 50 fois ne crée jamais 50 cartes/commissions.
+//      Pour product='topup', idempotence supplémentaire via orders.credited (voir
+//      apply_topup_for_order(), migration 0007) : sans cette marque, un callback rejoué
+//      aurait crédité plusieurs fois les mêmes points de recharge.
 //
 // Doit répondre HTTP 200 dans les 15 minutes pour que PawaPay considère le callback comme
 // livré (voir https://docs.pawapay.io/v2/docs/what_to_know#callbacks).
@@ -61,6 +64,9 @@ Deno.serve(async (req) => {
       if (order?.product === "card") {
         const { error: issueErr } = await svc.rpc("issue_card_for_order", { p_order_id: payment.order_id });
         if (issueErr) console.error("issue_card_for_order failed from pawapay-deposit-callback", issueErr);
+      } else if (order?.product === "topup") {
+        const { error: topupErr } = await svc.rpc("apply_topup_for_order", { p_order_id: payment.order_id });
+        if (topupErr) console.error("apply_topup_for_order failed from pawapay-deposit-callback", topupErr);
       }
       return json({ status: "PAID" });
     }

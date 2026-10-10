@@ -170,17 +170,92 @@ export async function initiateRefund(params: PawaPayRefundParams): Promise<PawaP
 }
 
 // ---------------------------------------------------------------------------
+// Initiation d'un paiement sortant (payout) — POST /v2/payouts.
+// Référence (consultée le 2026-10-10) : https://docs.pawapay.io/v2/api-reference/payouts/initiate-payout
+//
+// Utilisée par request-withdrawal/index.ts pour encaisser réellement un retrait de
+// commissions demandé par un distributeur depuis son tableau de bord. Même principe que
+// initiateDeposit()/initiateRefund() : `payoutId` est TOUJOURS généré côté serveur, jamais
+// par le client, et doit être réservé en base (ligne `withdrawals`, voir fonction SQL
+// claim_withdrawal()) AVANT cet appel pour garantir l'idempotence et empêcher qu'un
+// distributeur ne soit payé deux fois pour la même demande.
+// ---------------------------------------------------------------------------
+
+export type PawaPayPayoutParams = {
+  payoutId: string;             // UUID v4 généré côté serveur, jamais fourni par le client
+  amount: string;                // montant à verser, en chaîne (ex. "500"), jamais un flottant
+  currency: string;              // ISO 4217 — devise du distributeur bénéficiaire
+  phoneNumber: string;           // MSISDN du bénéficiaire, chiffres uniquement, sans "+" ni zéro initial
+  provider: string;               // code fournisseur PawaPay, ex. "MTN_MOMO_CMR"
+  clientReferenceId?: string;    // ex. l'id de la ligne `withdrawals`, pour rapprochement
+  customerMessage?: string;       // 4–22 caractères alphanumériques + espaces
+};
+
+export type PawaPayPayoutResult =
+  | { ok: true; status: "ACCEPTED"; payoutId: string; created?: string; raw: unknown }
+  | { ok: false; status: "REJECTED" | "DUPLICATE_IGNORED" | "HTTP_ERROR"; failureCode?: string; failureMessage?: string; raw: unknown };
+
+export async function initiatePayout(params: PawaPayPayoutParams): Promise<PawaPayPayoutResult> {
+  const body = {
+    payoutId: params.payoutId,
+    recipient: {
+      type: "MMO",
+      accountDetails: {
+        phoneNumber: params.phoneNumber,
+        provider: params.provider,
+      },
+    },
+    amount: params.amount,
+    currency: params.currency,
+    ...(params.clientReferenceId ? { clientReferenceId: params.clientReferenceId } : {}),
+    ...(params.customerMessage ? { customerMessage: params.customerMessage } : {}),
+  };
+
+  const res = await fetch(`${pawapayApiBase()}/v2/payouts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...pawapayAuthHeaders() },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    console.error("PawaPay initiatePayout HTTP error", res.status, data);
+    return {
+      ok: false,
+      status: "HTTP_ERROR",
+      failureCode: data?.failureReason?.failureCode,
+      failureMessage: data?.failureReason?.failureMessage,
+      raw: data,
+    };
+  }
+
+  if (data?.status === "ACCEPTED") {
+    return { ok: true, status: "ACCEPTED", payoutId: data.payoutId ?? params.payoutId, created: data.created, raw: data };
+  }
+  return {
+    ok: false,
+    status: data?.status ?? "REJECTED",
+    failureCode: data?.failureReason?.failureCode,
+    failureMessage: data?.failureReason?.failureMessage,
+    raw: data,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // GET /v2/active-conf — liste des pays/fournisseurs/devises actuellement actifs chez PawaPay.
 // Utilisé pour valider côté serveur qu'un code `provider` envoyé par le front (ex.
-// "MTN_MOMO_BEN") existe réellement et accepte des DEPOSIT dans la devise demandée, avant
-// d'appeler initiateDeposit() — on ne fait jamais confiance à un code fournisseur choisi par
-// le client sans le vérifier contre la configuration réelle de PawaPay.
+// "MTN_MOMO_BEN") existe réellement et accepte l'opération demandée (DEPOSIT ou PAYOUT) dans
+// la devise demandée, avant d'appeler initiateDeposit()/initiatePayout() — on ne fait jamais
+// confiance à un code fournisseur choisi par le client sans le vérifier contre la
+// configuration réelle de PawaPay.
 // Référence (consultée le 2026-10-10) : https://docs.pawapay.io/v2/api-reference/toolkit/active-configuration
+// (le paramètre operationType accepte aussi PAYOUT, REFUND, REMITTANCE, etc. — confirmé sur
+// cette même page).
 // ---------------------------------------------------------------------------
-export async function getActiveConfiguration(country?: string): Promise<unknown> {
+export async function getActiveConfiguration(country?: string, operationType: string = "DEPOSIT"): Promise<unknown> {
   const url = new URL(`${pawapayApiBase()}/v2/active-conf`);
   if (country) url.searchParams.set("country", country);
-  url.searchParams.set("operationType", "DEPOSIT");
+  url.searchParams.set("operationType", operationType);
   const res = await fetch(url.toString(), { headers: pawapayAuthHeaders() });
   if (!res.ok) {
     throw new Error(`Impossible de récupérer la configuration active PawaPay (HTTP ${res.status}).`);

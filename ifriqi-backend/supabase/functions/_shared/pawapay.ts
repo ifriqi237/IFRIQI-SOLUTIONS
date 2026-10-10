@@ -28,6 +28,99 @@ export function pawapayApiBase(): string {
     : "https://api.sandbox.pawapay.io";
 }
 
+// ---------------------------------------------------------------------------
+// Initiation d'un dépôt (collecte Mobile Money) — POST /v2/deposits.
+// Référence (consultée le 2026-10-10) : https://docs.pawapay.io/v2/api-reference/deposits/initiate-deposit
+//
+// Le serveur choisit toujours `depositId` lui-même (UUID v4, jamais fourni par le client) :
+// c'est à la fois l'identifiant idempotent PawaPay ET la valeur stockée dans
+// payments.provider_ref, sur laquelle repose l'index unique (provider, provider_ref) qui empêche
+// tout double traitement (0001_init.sql). Si create-order est rappelée deux fois pour la même
+// commande par erreur réseau côté client, on régénère un nouveau depositId : la protection contre
+// le double paiement vient de l'idempotence du depositId chez PawaPay + de la commande déjà PAID
+// côté serveur (create-order revérifie orders.payment_status avant de réinitier quoi que ce soit —
+// voir l'appel à cette fonction dans create-order/index.ts).
+// ---------------------------------------------------------------------------
+
+export type PawaPayDepositParams = {
+  depositId: string;        // UUID v4 généré côté serveur
+  amount: string;           // montant en chaîne, ex. "500" — jamais de nombre flottant
+  currency: string;         // ISO 4217, ex. "XOF"
+  phoneNumber: string;      // MSISDN, chiffres uniquement, avec indicatif pays, sans "+" ni zéro initial
+  provider: string;         // code fournisseur PawaPay, ex. "MTN_MOMO_BEN" (voir getActiveConfiguration)
+  clientReferenceId?: string; // ex. l'id de la commande IFRIQI, pour rapprochement
+  customerMessage?: string;   // 4–22 caractères alphanumériques + espaces (contrainte PawaPay)
+};
+
+export type PawaPayDepositResult =
+  | { ok: true; status: "ACCEPTED"; depositId: string; created: string; raw: unknown }
+  | { ok: false; status: "REJECTED" | "DUPLICATE_IGNORED" | "HTTP_ERROR"; failureCode?: string; failureMessage?: string; raw: unknown };
+
+export async function initiateDeposit(params: PawaPayDepositParams): Promise<PawaPayDepositResult> {
+  const body = {
+    depositId: params.depositId,
+    payer: {
+      type: "MMO",
+      accountDetails: {
+        phoneNumber: params.phoneNumber,
+        provider: params.provider,
+      },
+    },
+    amount: params.amount,
+    currency: params.currency,
+    ...(params.clientReferenceId ? { clientReferenceId: params.clientReferenceId } : {}),
+    ...(params.customerMessage ? { customerMessage: params.customerMessage } : {}),
+  };
+
+  const res = await fetch(`${pawapayApiBase()}/v2/deposits`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...pawapayAuthHeaders() },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    console.error("PawaPay initiateDeposit HTTP error", res.status, data);
+    return {
+      ok: false,
+      status: "HTTP_ERROR",
+      failureCode: data?.failureReason?.failureCode,
+      failureMessage: data?.failureReason?.failureMessage,
+      raw: data,
+    };
+  }
+
+  if (data?.status === "ACCEPTED") {
+    return { ok: true, status: "ACCEPTED", depositId: data.depositId ?? params.depositId, created: data.created, raw: data };
+  }
+  return {
+    ok: false,
+    status: data?.status ?? "REJECTED",
+    failureCode: data?.failureReason?.failureCode,
+    failureMessage: data?.failureReason?.failureMessage,
+    raw: data,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/active-conf — liste des pays/fournisseurs/devises actuellement actifs chez PawaPay.
+// Utilisé pour valider côté serveur qu'un code `provider` envoyé par le front (ex.
+// "MTN_MOMO_BEN") existe réellement et accepte des DEPOSIT dans la devise demandée, avant
+// d'appeler initiateDeposit() — on ne fait jamais confiance à un code fournisseur choisi par
+// le client sans le vérifier contre la configuration réelle de PawaPay.
+// Référence (consultée le 2026-10-10) : https://docs.pawapay.io/v2/api-reference/toolkit/active-configuration
+// ---------------------------------------------------------------------------
+export async function getActiveConfiguration(country?: string): Promise<unknown> {
+  const url = new URL(`${pawapayApiBase()}/v2/active-conf`);
+  if (country) url.searchParams.set("country", country);
+  url.searchParams.set("operationType", "DEPOSIT");
+  const res = await fetch(url.toString(), { headers: pawapayAuthHeaders() });
+  if (!res.ok) {
+    throw new Error(`Impossible de récupérer la configuration active PawaPay (HTTP ${res.status}).`);
+  }
+  return res.json();
+}
+
 function pawapayAuthHeaders(): Record<string, string> {
   const token = Deno.env.get("PAWAPAY_API_TOKEN");
   return token ? { Authorization: `Bearer ${token}` } : {};

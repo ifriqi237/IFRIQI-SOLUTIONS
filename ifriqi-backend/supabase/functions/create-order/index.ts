@@ -7,6 +7,7 @@
 // instructions à suivre pour payer.
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient, userClient } from "../_shared/supabase.ts";
+import { initiateDeposit, getActiveConfiguration } from "../_shared/pawapay.ts";
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -19,11 +20,15 @@ Deno.serve(async (req) => {
     }
 
     const body = await req.json();
-    const { profileId, product, refCode, method, phone } = body as {
+    const { profileId, product, refCode, method, phone, pawapayProvider } = body as {
       profileId: string; product: "card" | "topup"; refCode?: string; method: string; phone?: string;
+      pawapayProvider?: string; // requis si method === 'pawapay' — code fournisseur PawaPay, ex. "MTN_MOMO_BEN"
     };
     if (!profileId || !["card", "topup"].includes(product)) {
       return json({ error: "profileId et product ('card'|'topup') sont requis." }, 400);
+    }
+    if (method === "pawapay" && (!phone || !pawapayProvider)) {
+      return json({ error: "phone et pawapayProvider sont requis pour un paiement PawaPay." }, 400);
     }
 
     const svc = serviceClient();
@@ -67,20 +72,32 @@ Deno.serve(async (req) => {
     if (orderErr) { console.error("create-order insert error", orderErr); return json({ error: "Impossible de créer la commande pour le moment." }, 500); }
 
     // ---- Initiation du paiement chez le prestataire ----
-    const provider = method === "paypal" ? "paypal" : "cinetpay"; // momo/card/other -> CinetPay (agrégateur Mobile Money + carte en zone CEMAC/UEMOA)
+    const provider = method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : "cinetpay";
     const init = provider === "paypal"
       ? await initPaypal(order.id, priceFcfa)
+      : provider === "pawapay"
+      ? await initPawapay(order.id, displayAmount, currency, phone!, pawapayProvider!)
       : await initCinetpay(order.id, priceFcfa, method, phone);
 
+    // Si l'initiation a été rejetée immédiatement par le prestataire (ex. opérateur PawaPay
+    // inconnu, devise non supportée, token manquant), on le trace comme un paiement FAILED
+    // plutôt que PENDING — jamais de ligne "en attente" pour un paiement qui n'a en réalité
+    // jamais pu démarrer, et on renvoie l'erreur réelle au client au lieu de faire comme si
+    // tout allait bien.
+    const skipPayment = (init as { skipPayment?: boolean }).skipPayment === true;
     await svc.from("payments").insert({
       order_id: order.id,
       provider,
       provider_ref: init.reference ?? null,
       method,
       amount_fcfa: priceFcfa,
-      status: "PENDING",
+      status: skipPayment ? "FAILED" : "PENDING",
       raw_payload: init.raw ?? null,
     });
+    if (skipPayment) {
+      await svc.from("orders").update({ payment_status: "FAILED" }).eq("id", order.id);
+      return json({ orderId: order.id, provider, ...init.client }, 422);
+    }
 
     return json({ orderId: order.id, provider, ...init.client });
   } catch (e) {
@@ -125,6 +142,65 @@ async function initCinetpay(orderId: string, amountFcfa: number, method: string,
   });
   const data = await res.json();
   return { reference: transactionId, raw: data, client: { paymentUrl: data?.data?.payment_url ?? null, cinetpayResponse: data } };
+}
+
+// ---------------------------------------------------------------------------
+// PawaPay (Mobile Money — Afrique de l'Est/Ouest/Centrale). Nécessite PAWAPAY_API_TOKEN.
+// PAWAPAY_ENV = 'sandbox' (par défaut) ou 'production'. Contrairement à CinetPay/PayPal, PawaPay
+// n'a pas de mode "sandbox implicite sans clés" ici : sans PAWAPAY_API_TOKEN, on refuse plutôt
+// que de simuler, car un depositId mal formé ou un appel sans token produirait une erreur HTTP
+// confuse plutôt qu'un vrai comportement sandbox — mieux vaut un message clair.
+//
+// Le statut renvoyé ici (ACCEPTED) ne signifie PAS que le paiement est confirmé : seul le
+// callback pawapay-deposit-callback (déjà déployé), qui revérifie le statut réel auprès de
+// PawaPay avant d'écrire quoi que ce soit, fait passer orders.payment_status à 'PAID'. Tant que
+// le callback n'est pas reçu, orders.payment_status reste 'PENDING' — c'est voulu.
+// ---------------------------------------------------------------------------
+async function initPawapay(orderId: string, displayAmount: number, currency: string, phone: string, pawapayProvider: string) {
+  const token = Deno.env.get("PAWAPAY_API_TOKEN");
+  if (!token) {
+    return { reference: null, raw: { sandbox: true }, client: { sandbox: true, message: "PAWAPAY_API_TOKEN non configurée : paiement PawaPay indisponible pour le moment." }, skipPayment: true };
+  }
+
+  // Ne fait jamais confiance au code fournisseur envoyé par le front sans le vérifier contre la
+  // configuration réelle de PawaPay (pays/opérateurs/devises actuellement actifs).
+  const activeConf = await getActiveConfiguration().catch((e) => {
+    console.error("create-order: getActiveConfiguration a échoué", e);
+    return null;
+  });
+  const providerKnown = Array.isArray((activeConf as { countries?: unknown[] })?.countries)
+    ? (activeConf as { countries: Array<{ providers?: Array<{ provider: string; currencies?: Array<{ currency: string }> }> }> }).countries
+        .flatMap((c) => c.providers ?? [])
+        .find((p) => p.provider === pawapayProvider)
+    : undefined;
+  if (!providerKnown) {
+    return { reference: null, raw: { error: "unknown_provider" }, client: { error: `Opérateur PawaPay '${pawapayProvider}' inconnu ou indisponible actuellement.` }, skipPayment: true };
+  }
+  const supportsCurrency = (providerKnown.currencies ?? []).some((c) => c.currency === currency);
+  if (!supportsCurrency) {
+    return { reference: null, raw: { error: "unsupported_currency" }, client: { error: `L'opérateur '${pawapayProvider}' ne prend pas en charge la devise ${currency}.` }, skipPayment: true };
+  }
+
+  const depositId = crypto.randomUUID();
+  const amountStr = (Math.round(displayAmount * 100) / 100).toString(); // pas de zéros non significatifs, pas de notation flottante bizarre
+  const phoneDigits = phone.replace(/[^0-9]/g, "").replace(/^0+/, "");
+
+  const result = await initiateDeposit({
+    depositId,
+    amount: amountStr,
+    currency,
+    phoneNumber: phoneDigits,
+    provider: pawapayProvider,
+    clientReferenceId: orderId,
+    customerMessage: "IFRIQI",
+  });
+
+  if (!result.ok) {
+    console.error("create-order: initiateDeposit PawaPay rejetée", result);
+    return { reference: depositId, raw: result.raw, client: { error: result.failureMessage ?? "Paiement PawaPay refusé.", failureCode: result.failureCode }, skipPayment: true };
+  }
+
+  return { reference: depositId, raw: result.raw, client: { depositId, status: result.status, message: "Paiement PawaPay initié. Validez la demande sur votre téléphone." } };
 }
 
 // ---------------------------------------------------------------------------

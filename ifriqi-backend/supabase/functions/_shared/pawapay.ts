@@ -272,10 +272,22 @@ function pawapayAuthHeaders(): Record<string, string> {
   // depuis une page web ou un traitement de texte). `fetch` refuse alors de construire l'en-tête
   // Authorization ("Failed to construct 'Request': ... is not a valid ByteString"), ce qui faisait
   // échouer silencieusement TOUS les appels sortants vers PawaPay (dépôts, retraits, remboursements
-  // ET la liste des opérateurs), bien avant même d'atteindre leur serveur. Un jeton PawaPay valide
-  // (JWT) ne contient que des lettres, chiffres, points, tirets et underscores : on ne garde que
-  // ces caractères pour éliminer la casse sans risquer de corrompre un jeton par ailleurs correct.
-  const token = raw.trim().replace(/[^A-Za-z0-9._-]/g, "");
+  // ET la liste des opérateurs), bien avant même d'atteindre leur serveur.
+  let cleaned = raw.trim();
+  // Si l'utilisateur a collé "Bearer eyJ..." au lieu du jeton seul, on retire ce préfixe avant de
+  // continuer : sinon le filtre ci-dessous collait "Bearer" et le jeton ensemble sans espace
+  // (ex. "BearereyJ...") une fois l'espace supprimé, ce qui produit un jeton syntaxiquement valide
+  // mais totalement différent du vrai jeton → PawaPay répond 401 (observé en production ici).
+  cleaned = cleaned.replace(/^bearer\s+/i, "");
+  // Un jeton PawaPay valide (JWT) ne contient que des lettres, chiffres, points, tirets et
+  // underscores : on ne garde que ces caractères pour éliminer tout caractère invisible résiduel
+  // sans risquer de corrompre un jeton par ailleurs correct.
+  const token = cleaned.replace(/[^A-Za-z0-9._-]/g, "");
+  // Diagnostic temporaire (pas le jeton en clair) : si l'appel échoue encore en 401 après ce
+  // nettoyage, la longueur/forme logguée ici permet de vérifier côté serveur si le jeton stocké
+  // ressemble à un JWT PawaPay plausible (3 segments séparés par des points) sans l'exposer.
+  const segments = token.split(".").length;
+  console.log(`pawapayAuthHeaders: jeton nettoyé — longueur=${token.length}, segments=${segments}, préfixe=${token.slice(0, 6)}…`);
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 

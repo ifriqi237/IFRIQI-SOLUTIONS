@@ -266,28 +266,23 @@ export async function getActiveConfiguration(country?: string, operationType: st
 function pawapayAuthHeaders(): Record<string, string> {
   const raw = Deno.env.get("PAWAPAY_API_TOKEN");
   if (!raw) return {};
-  // F-14 (incident) : le jeton collé dans Project Settings → Edge Functions → Secrets contenait
-  // au moins un caractère hors de la plage ASCII imprimable (espace insécable, guillemet
-  // typographique, tiret long, etc. — invisible à l'oeil mais introduit par un copier-coller
-  // depuis une page web ou un traitement de texte). `fetch` refuse alors de construire l'en-tête
-  // Authorization ("Failed to construct 'Request': ... is not a valid ByteString"), ce qui faisait
-  // échouer silencieusement TOUS les appels sortants vers PawaPay (dépôts, retraits, remboursements
-  // ET la liste des opérateurs), bien avant même d'atteindre leur serveur.
+  // F-14 (incident résolu le 2026-10-10) : le jeton collé dans Project Settings → Edge Functions →
+  // Secrets contenait initialement des caractères hors de la plage ASCII imprimable (un premier
+  // collage était même entièrement composé de caractères non standards — probablement copié
+  // depuis un texte mis en forme avec une police "fantaisie" — et ne contenait donc aucun jeton
+  // exploitable). `fetch` refuse de construire l'en-tête Authorization avec de tels caractères
+  // ("Failed to construct 'Request': ... is not a valid ByteString"), ce qui faisait échouer
+  // silencieusement TOUS les appels sortants vers PawaPay (dépôts, retraits, remboursements ET la
+  // liste des opérateurs). Le secret a depuis été recollé correctement, mais on garde ce nettoyage
+  // défensif pour ne pas revivre le même incident sur un futur copier-coller imparfait.
   let cleaned = raw.trim();
-  // Si l'utilisateur a collé "Bearer eyJ..." au lieu du jeton seul, on retire ce préfixe avant de
-  // continuer : sinon le filtre ci-dessous collait "Bearer" et le jeton ensemble sans espace
-  // (ex. "BearereyJ...") une fois l'espace supprimé, ce qui produit un jeton syntaxiquement valide
-  // mais totalement différent du vrai jeton → PawaPay répond 401 (observé en production ici).
+  // Si quelqu'un colle un jour "Bearer eyJ..." au lieu du jeton seul, on retire ce préfixe avant
+  // de continuer : sinon le filtre suivant fusionnait "Bearer" et le jeton sans espace.
   cleaned = cleaned.replace(/^bearer\s+/i, "");
   // Un jeton PawaPay valide (JWT) ne contient que des lettres, chiffres, points, tirets et
   // underscores : on ne garde que ces caractères pour éliminer tout caractère invisible résiduel
   // sans risquer de corrompre un jeton par ailleurs correct.
   const token = cleaned.replace(/[^A-Za-z0-9._-]/g, "");
-  // Diagnostic temporaire (pas le jeton en clair) : si l'appel échoue encore en 401 après ce
-  // nettoyage, la longueur/forme logguée ici permet de vérifier côté serveur si le jeton stocké
-  // ressemble à un JWT PawaPay plausible (3 segments séparés par des points) sans l'exposer.
-  const segments = token.split(".").length;
-  console.log(`pawapayAuthHeaders: jeton nettoyé — longueur=${token.length}, segments=${segments}, préfixe=${token.slice(0, 6)}…`);
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 

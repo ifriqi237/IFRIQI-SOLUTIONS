@@ -432,7 +432,18 @@ const AuthBridge={
     return {needsConfirmation:false,id:authUser.id};
   },
   async signIn({email,password}){
-    const {data,error}=await sb.auth.signInWithPassword({email,password});
+    let {data,error}=await sb.auth.signInWithPassword({email,password});
+    if(error&&/email not confirmed/i.test(error.message||'')){
+      // Même mesure temporaire que dans signUp() (voir son commentaire) : ce compte a été
+      // créé avant la mise en place du correctif, ou l'appel à l'inscription a échoué sans
+      // bloquer la création du compte. On confirme maintenant par email (auth-auto-confirm),
+      // puis on retente une seule fois — toujours avec le mot de passe fourni, jamais sans
+      // revérification.
+      try{
+        await callEdgeFunction('auth-auto-confirm',{email});
+        ({data,error}=await sb.auth.signInWithPassword({email,password}));
+      }catch(e){/* on retombe sur l'erreur d'origine ci-dessous */}
+    }
     if(error)throw error;
     const authUser=data.user;
     let {data:row}=await sb.from('app_users').select('*').eq('id',authUser.id).maybeSingle();

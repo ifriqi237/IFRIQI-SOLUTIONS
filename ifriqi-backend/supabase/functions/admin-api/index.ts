@@ -82,8 +82,16 @@ Deno.serve(async (req) => {
         const { data: dists, error } = await q;
         if (error) return dbError("list_distributors", error);
         const userIds = [...new Set((dists ?? []).map((d) => d.user_id))];
+        // F-17 (2026-10-11) : ce select omettait role/status. Le frontend fusionne pourtant ce
+        // "holder" directement dans db.users (syncAdminDistributors -> mapAdminUser()), qui
+        // retombe sur role:'user'/status:'active' par défaut quand le champ est absent — ce qui
+        // écrasait silencieusement le rôle 'admin' réel de l'utilisateur connecté dès qu'il
+        // apparaissait aussi comme titulaire d'une fiche distributeur (cas vécu : un admin qui
+        // est aussi distributeur voyait son propre accès admin rétrogradé en cliquant sur
+        // n'importe quel onglet du panneau admin, syncAdminDistributors() étant appelée à chaque
+        // changement d'onglet). Inclure role/status élimine ce faux-positif à la source.
         const { data: users } = userIds.length
-          ? await svc.from("app_users").select("id,first_name,last_name,email,phone,country").in("id", userIds)
+          ? await svc.from("app_users").select("id,first_name,last_name,email,phone,country,role,status").in("id", userIds)
           : { data: [] };
         return json({
           distributors: (dists ?? []).map((d) => ({

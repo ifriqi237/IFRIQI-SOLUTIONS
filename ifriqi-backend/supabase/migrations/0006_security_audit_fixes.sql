@@ -42,7 +42,15 @@ alter policy "dist requests withdrawal" on withdrawals with check (false);
 -- ----------------------------------------------------------------------------
 alter function public.create_commissions_for_order(uuid) set search_path = public;
 alter function public.refund_order(uuid) set search_path = public;
-alter function public.issue_card_for_order(uuid) set search_path = public;
+-- RÉGRESSION constatée en production le 2026-10-11 à 17:37 UTC (corrigée le même jour) :
+-- fixer search_path=public SEUL sur issue_card_for_order casse gen_random_bytes()/digest()
+-- (pgcrypto), installées dans le schéma `extensions` sur ce projet, pas dans `public`.
+-- Conséquence réelle : un paiement carte confirmé par PawaPay (orders.payment_status=PAID)
+-- ne faisait plus jamais émettre la carte ("function gen_random_bytes(integer) does not
+-- exist"), laissant le client bloqué sur l'écran "Continuer" indéfiniment. `extensions`
+-- doit donc être inclus dans le search_path, exactement comme le fait déjà
+-- set_distributor_code() depuis l'origine (`set search_path to 'public', 'extensions'`).
+alter function public.issue_card_for_order(uuid) set search_path = public, extensions;
 alter function public.check_withdrawal_balance() set search_path = public;
 
 -- ----------------------------------------------------------------------------

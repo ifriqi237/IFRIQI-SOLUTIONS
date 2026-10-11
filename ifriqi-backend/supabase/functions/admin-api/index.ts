@@ -16,12 +16,16 @@
 //   list_commissions       { limit? }                         -> commissions + distributeur
 //   list_withdrawals       { status? }                        -> retraits + distributeur
 //   list_users             { limit? }                         -> comptes
+//   list_scans             { limit? }                         -> journal des scans QR (table scans)
+//   list_audit_log         { limit? }                         -> journal des actions admin
+//   list_support           { limit? }                         -> messages du formulaire de contact
+//   list_settings          {}                                 -> paramètres courants (settings, id=1)
 //   approve_distributor    { dist_id }                        -> VERIFICATION -> ACTIVE
 //   suspend_distributor    { dist_id }                        -> * -> SUSPENDED
 //   reactivate_distributor { dist_id }                        -> SUSPENDED -> ACTIVE
 //   suspend_user           { user_id }                        -> active -> suspended
 //   reactivate_user        { user_id }                        -> suspended -> active
-//   update_settings        { price_fcfa?, comm_l1_fcfa?, ... } -> met à jour settings (id=1)
+//   update_settings        { price_fcfa?, ..., payment_methods?, payout_methods? } -> settings (id=1)
 //
 // Principes de sécurité (mêmes que refund-order/request-withdrawal) :
 //   1. Le rôle admin est revérifié ici à chaque appel via le JWT (jamais un champ envoyé par le
@@ -31,6 +35,9 @@
 //      admins concurrents ne peuvent pas produire un état incohérent silencieux.
 //   3. Un admin ne peut jamais se suspendre lui-même (verrou trivial pour éviter de se
 //      retrouver bloqué hors du panneau par erreur).
+//   4. F-19/F-20 (2026-10-11) : chaque mutation réussie de cette fonction écrit une ligne dans
+//      audit_log (logAudit() plus bas) — c'est ce qui alimente réellement l'onglet "Journal" du
+//      panneau admin, au lieu du tableau purement local d'avant.
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient, userClient } from "../_shared/supabase.ts";
 
@@ -141,6 +148,7 @@ Deno.serve(async (req) => {
           .maybeSingle();
         if (error) return dbError("set_card_status", error);
         if (!data) return json({ error: "Aucune carte pour ce profil." }, 404);
+        await logAudit(svc, user.id, "set_card_status_" + status.toLowerCase(), profileId);
         return json({ card: data });
       }
 
@@ -165,6 +173,7 @@ Deno.serve(async (req) => {
           .select()
           .single();
         if (error) return dbError("grant_card_edits", error);
+        await logAudit(svc, user.id, "grant_card_edits_" + amount, profileId);
         return json({ card: data });
       }
 
@@ -207,6 +216,60 @@ Deno.serve(async (req) => {
         return json({ users: users ?? [] });
       }
 
+      case "list_scans": {
+        const limit = clampLimit(body.limit, 200, 500);
+        const { data, error } = await svc
+          .from("scans")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(limit);
+        if (error) return dbError("list_scans", error);
+        return json({ scans: data ?? [] });
+      }
+
+      case "list_audit_log": {
+        const limit = clampLimit(body.limit, 200, 500);
+        const { data: rows, error } = await svc
+          .from("audit_log")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(limit);
+        if (error) return dbError("list_audit_log", error);
+        const actorIds = [...new Set((rows ?? []).map((r) => r.actor_id).filter(Boolean))];
+        // Select limité à id/first_name/last_name/email/phone (pas role/status) et jamais
+        // fusionné dans db.users côté frontend : juste un libellé d'affichage pour le journal,
+        // donc aucun risque de répéter le bug F-17 (role écrasé par défaut).
+        const { data: actors } = actorIds.length
+          ? await svc.from("app_users").select("id,first_name,last_name,email,phone").in("id", actorIds)
+          : { data: [] };
+        return json({
+          logs: (rows ?? []).map((r) => {
+            const a = (actors ?? []).find((x) => x.id === r.actor_id);
+            const label = a
+              ? (((a.first_name || "") + " " + (a.last_name || "")).trim() || a.email || a.phone || a.id)
+              : (r.actor_id || "—");
+            return { ...r, actor_label: label };
+          }),
+        });
+      }
+
+      case "list_support": {
+        const limit = clampLimit(body.limit, 200, 500);
+        const { data, error } = await svc
+          .from("support_messages")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(limit);
+        if (error) return dbError("list_support", error);
+        return json({ messages: data ?? [] });
+      }
+
+      case "list_settings": {
+        const { data, error } = await svc.from("settings").select("*").eq("id", 1).single();
+        if (error) return dbError("list_settings", error);
+        return json({ settings: data });
+      }
+
       case "approve_distributor": {
         const distId = requireString(body.dist_id, "dist_id");
         if (typeof distId !== "string") return distId;
@@ -219,6 +282,7 @@ Deno.serve(async (req) => {
           .maybeSingle();
         if (error) return dbError("approve_distributor", error);
         if (!data) return json({ error: "Ce distributeur n'est pas (ou plus) en attente de vérification." }, 409);
+        await logAudit(svc, user.id, "approve_distributor", distId);
         return json({ distributor: data });
       }
 
@@ -234,6 +298,7 @@ Deno.serve(async (req) => {
           .maybeSingle();
         if (error) return dbError("suspend_distributor", error);
         if (!data) return json({ error: "Ce distributeur est déjà suspendu ou introuvable." }, 409);
+        await logAudit(svc, user.id, "suspend_distributor", distId);
         return json({ distributor: data });
       }
 
@@ -249,6 +314,7 @@ Deno.serve(async (req) => {
           .maybeSingle();
         if (error) return dbError("reactivate_distributor", error);
         if (!data) return json({ error: "Ce distributeur n'est pas suspendu." }, 409);
+        await logAudit(svc, user.id, "reactivate_distributor", distId);
         return json({ distributor: data });
       }
 
@@ -265,6 +331,7 @@ Deno.serve(async (req) => {
           .maybeSingle();
         if (error) return dbError("suspend_user", error);
         if (!data) return json({ error: "Ce compte est déjà suspendu ou introuvable." }, 409);
+        await logAudit(svc, user.id, "suspend_user", userId);
         return json({ user: data });
       }
 
@@ -280,12 +347,13 @@ Deno.serve(async (req) => {
           .maybeSingle();
         if (error) return dbError("reactivate_user", error);
         if (!data) return json({ error: "Ce compte n'est pas suspendu." }, 409);
+        await logAudit(svc, user.id, "reactivate_user", userId);
         return json({ user: data });
       }
 
       case "update_settings": {
         const fields = ["price_fcfa", "comm_l1_fcfa", "comm_l2_fcfa", "min_withdraw_fcfa", "validation_days", "edits_included"] as const;
-        const update: Record<string, number> = {};
+        const update: Record<string, unknown> = {};
         for (const f of fields) {
           if (body[f] !== undefined) {
             const v = body[f];
@@ -295,9 +363,33 @@ Deno.serve(async (req) => {
             update[f] = v;
           }
         }
+        // F-18bis (2026-10-11) : les bascules "Passerelle" (méthodes de paiement/retrait)
+        // n'étaient jusqu'ici qu'un état local — chaque admin voyait sa propre version selon
+        // son navigateur. On les persiste maintenant dans settings, comme le reste des
+        // paramètres. Toujours envoyées comme objet complet (jamais un simple diff) pour
+        // pouvoir vérifier ici qu'il en reste au moins une activée, même règle que côté client.
+        if (body.payment_methods !== undefined) {
+          const pm = body.payment_methods as Record<string, unknown>;
+          const keys = ["momo", "card", "paypal", "other"];
+          if (typeof pm !== "object" || pm === null || keys.some((k) => typeof pm[k] !== "boolean")) {
+            return json({ error: "payment_methods doit contenir momo/card/paypal/other en booléen." }, 400);
+          }
+          if (!keys.some((k) => pm[k])) return json({ error: "Au moins un moyen de paiement doit rester actif." }, 400);
+          update.payment_methods = pm;
+        }
+        if (body.payout_methods !== undefined) {
+          const pm = body.payout_methods as Record<string, unknown>;
+          const keys = ["momo", "bank", "paypal", "other"];
+          if (typeof pm !== "object" || pm === null || keys.some((k) => typeof pm[k] !== "boolean")) {
+            return json({ error: "payout_methods doit contenir momo/bank/paypal/other en booléen." }, 400);
+          }
+          if (!keys.some((k) => pm[k])) return json({ error: "Au moins un moyen de retrait doit rester actif." }, 400);
+          update.payout_methods = pm;
+        }
         if (Object.keys(update).length === 0) return json({ error: "Aucun champ à mettre à jour." }, 400);
         const { data, error } = await svc.from("settings").update(update).eq("id", 1).select().single();
         if (error) return dbError("update_settings", error);
+        await logAudit(svc, user.id, "update_settings", Object.keys(update).join(","));
         return json({ settings: data });
       }
 
@@ -323,6 +415,22 @@ function requireString(v: unknown, field: string): string | Response {
 function dbError(action: string, error: unknown): Response {
   console.error(`admin-api: ${action} a échoué`, error);
   return json({ error: "Une erreur est survenue lors de l'opération." }, 500);
+}
+
+// F-19/F-20 (2026-10-11) : journal réel des actions admin (table audit_log), alimentant
+// l'onglet "Journal" du panneau admin. Volontairement best-effort : un échec d'écriture du
+// journal ne doit jamais faire échouer l'action elle-même (déjà appliquée en base à ce stade).
+async function logAudit(
+  svc: ReturnType<typeof serviceClient>,
+  actorId: string,
+  action: string,
+  resource?: string | null,
+) {
+  try {
+    await svc.from("audit_log").insert({ actor_id: actorId, action, resource: resource ?? null });
+  } catch (e) {
+    console.error("admin-api: logAudit a échoué", e);
+  }
 }
 
 function json(body: unknown, status = 200) {

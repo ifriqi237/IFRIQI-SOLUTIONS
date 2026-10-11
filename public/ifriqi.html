@@ -403,19 +403,33 @@ const AuthBridge={
     if(error)throw error;
     const authUser=data.user;
     const row={id:authUser.id,first_name:firstName,last_name:lastName,phone,email,country,country_code:countryCode};
-    if(data.session){
-      // Confirmation email désactivée (ou déjà confirmé) côté projet Supabase : une
-      // session est immédiatement active, on peut créer la ligne app_users tout de suite.
-      const {error:upErr}=await sb.from('app_users').upsert(row);
-      if(upErr)throw upErr;
-      upsertLocalUser(mapAppUser(authUser,row));
-      return {needsConfirmation:false,id:authUser.id};
+    let session=data.session;
+    if(!session){
+      // Mesure temporaire : "Confirm email" est activé côté projet Supabase mais aucun
+      // fournisseur SMTP réel n'y est encore branché, donc l'email de confirmation n'arrive
+      // jamais à personne — toute inscription restait bloquée pour toujours avec "Email not
+      // confirmed" au moment de se connecter. En attendant qu'un SMTP réel soit configuré, on
+      // confirme le compte immédiatement côté serveur (auth-auto-confirm, service_role) puis on
+      // se connecte tout de suite, au lieu d'attendre un email qui ne viendra pas.
+      try{
+        await callEdgeFunction('auth-auto-confirm',{user_id:authUser.id});
+        const signed=await sb.auth.signInWithPassword({email,password});
+        if(signed.error)throw signed.error;
+        session=signed.data.session;
+      }catch(e){
+        // Repli : si la confirmation automatique échoue pour une raison quelconque, on retombe
+        // sur l'ancien comportement (attente de confirmation par email) plutôt que de bloquer
+        // l'inscription avec une erreur opaque.
+        AuthBridge._pendingProfile=row;
+        return {needsConfirmation:true,id:authUser.id};
+      }
     }
-    // Confirmation email activée : aucune session tant que le lien reçu par email n'a pas
-    // été cliqué. On ne peut pas encore insérer dans app_users (pas de session = pas de
-    // auth.uid() côté RLS) ; le profil est créé à la première connexion réussie (signIn()).
-    AuthBridge._pendingProfile=row;
-    return {needsConfirmation:true,id:authUser.id};
+    const {error:upErr}=await sb.from('app_users').upsert(row);
+    if(upErr)throw upErr;
+    upsertLocalUser(mapAppUser(authUser,row));
+    db.session=authUser.id;
+    await Promise.all([syncMyProfiles(),syncDistributorAndFinance()]).catch(()=>null);
+    return {needsConfirmation:false,id:authUser.id};
   },
   async signIn({email,password}){
     const {data,error}=await sb.auth.signInWithPassword({email,password});

@@ -10,6 +10,9 @@
 // Actions :
 //   list_orders            { limit? }                         -> commandes récentes + paiement
 //   list_distributors      { status? }                        -> distributeurs + titulaire
+//   list_cards              { limit? }                         -> profils + cartes (tous les comptes)
+//   set_card_status        { profile_id, status }             -> ACTIVE <-> DEACTIVATED
+//   grant_card_edits       { profile_id, amount }              -> crédite N éditions sur la carte
 //   list_commissions       { limit? }                         -> commissions + distributeur
 //   list_withdrawals       { status? }                        -> retraits + distributeur
 //   list_users             { limit? }                         -> comptes
@@ -99,6 +102,70 @@ Deno.serve(async (req) => {
             holder: (users ?? []).find((u) => u.id === d.user_id) ?? null,
           })),
         });
+      }
+
+      case "list_cards": {
+        // F-18 (2026-10-11) : l'onglet "Cartes" du panneau admin affichait jusqu'ici uniquement
+        // les profils déjà connus en local (db.profiles, peuplé seulement par la propre carte
+        // de l'admin connecté) — jamais les profils des AUTRES utilisateurs, et le bandeau
+        // "prototype local, non connecté à la base" le signalait explicitement. Ajoute la
+        // lecture réelle de tous les profils + cartes. Pas de jointure app_users ici : la
+        // colonne "titulaire" affichée vient de profiles.first_name/last_name (le nom imprimé
+        // sur la carte), jamais du compte — donc aucun risque de répéter le bug F-17
+        // (role/status) puisqu'app_users n'est pas touché par cette action.
+        const limit = clampLimit(body.limit, 300, 1000);
+        const { data: profiles, error } = await svc
+          .from("profiles")
+          .select("*, cards(*)")
+          .order("created_at", { ascending: false })
+          .limit(limit);
+        if (error) return dbError("list_cards", error);
+        const withCard = (profiles ?? [])
+          .map((p) => ({ ...p, card: Array.isArray(p.cards) ? p.cards[0] : p.cards }))
+          .filter((p) => p.card);
+        return json({ profiles: withCard });
+      }
+
+      case "set_card_status": {
+        const profileId = requireString(body.profile_id, "profile_id");
+        if (typeof profileId !== "string") return profileId;
+        const status = body.status;
+        if (status !== "ACTIVE" && status !== "DEACTIVATED") {
+          return json({ error: "status doit être 'ACTIVE' ou 'DEACTIVATED'." }, 400);
+        }
+        const { data, error } = await svc
+          .from("cards")
+          .update({ status })
+          .eq("profile_id", profileId)
+          .select()
+          .maybeSingle();
+        if (error) return dbError("set_card_status", error);
+        if (!data) return json({ error: "Aucune carte pour ce profil." }, 404);
+        return json({ card: data });
+      }
+
+      case "grant_card_edits": {
+        const profileId = requireString(body.profile_id, "profile_id");
+        if (typeof profileId !== "string") return profileId;
+        const amount = typeof body.amount === "number" && Number.isFinite(body.amount) && body.amount > 0
+          ? Math.floor(body.amount)
+          : null;
+        if (amount === null) return json({ error: "amount doit être un entier strictement positif." }, 400);
+        const { data: card, error: fetchErr } = await svc
+          .from("cards")
+          .select("id,credits")
+          .eq("profile_id", profileId)
+          .maybeSingle();
+        if (fetchErr) return dbError("grant_card_edits", fetchErr);
+        if (!card) return json({ error: "Aucune carte pour ce profil." }, 404);
+        const { data, error } = await svc
+          .from("cards")
+          .update({ credits: card.credits + amount })
+          .eq("id", card.id)
+          .select()
+          .single();
+        if (error) return dbError("grant_card_edits", error);
+        return json({ card: data });
       }
 
       case "list_commissions": {

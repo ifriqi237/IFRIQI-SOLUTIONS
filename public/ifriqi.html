@@ -640,6 +640,29 @@ async function syncAdminDistributors(){
     mergeById(db.distributors,r,{id:r.id,userId:r.user_id,code:r.code,status:r.status,referredBy:r.referred_by,activatedAt:msToLocal(Date.now(),r.activated_at),_real:true});
   });
 }
+// F-18 (2026-10-11) : fusionne TOUS les profils/cartes réels (pas seulement ceux de l'admin
+// connecté) dans db.profiles, pour que l'onglet "Cartes" et les compteurs de l'onglet "Aperçu"
+// (cartes actives/désactivées/épuisées) reflètent la vraie base plutôt que le prototype local.
+// Même logique de fusion par id/serverId que syncMyProfiles, pour ne jamais dupliquer une ligne
+// déjà présente localement (ex. carte de l'admin lui-même, déjà synchronisée par ailleurs).
+async function syncAdminCards(){
+  const {profiles}=await supaAdmin('list_cards',{limit:500});
+  (profiles||[]).forEach(row=>{
+    const card=row.card;if(!card)return;
+    const existing=db.profiles.find(p=>p.id===row.id||p.serverId===row.id);
+    const mapped={
+      id:existing?existing.id:row.id,serverId:row.id,userId:row.user_id,type:row.type,
+      first:row.first_name||'',last:row.last_name||'',dob:row.dob||'',sex:row.sex||'',
+      address:row.address||'',photo:row.photo_url||null,
+      printContact:!!row.print_contact,printHealth:!!row.print_health,
+      contacts:row.contacts||[],health:row.health||{},
+      card:{publicId:card.public_id,token:'',tokenHash:card.token_hash,status:card.status,version:card.version,createdAt:msToLocal(Date.now(),card.created_at),credits:card.credits,editsUsed:card.edits_used,revoked:[],countryCode:card.country_code||''},
+      createdAt:msToLocal(Date.now(),row.created_at),
+      _real:true,
+    };
+    mergeById(db.profiles,row,mapped);
+  });
+}
 async function syncAdminOrders(){
   const {orders}=await supaAdmin('list_orders',{limit:200});
   (orders||[]).forEach(o=>{
@@ -658,7 +681,7 @@ async function syncAdminWithdrawals(){
 // Onglets backés par de vraies données serveur : on synchronise toujours distributeurs (utilisé
 // pour retrouver le code/titulaire dans plusieurs tableaux), puis la liste propre à l'onglet actif.
 async function syncAdminTab(tab){
-  await syncAdminDistributors();
+  await Promise.all([syncAdminDistributors(),syncAdminCards()]);
   if(tab==='orders')await syncAdminOrders();
   else if(tab==='comm')await syncAdminCommissions();
   else if(tab==='wd')await syncAdminWithdrawals();
@@ -1934,10 +1957,10 @@ async function adminView(){
    apercu:()=>`<div class="kpis">${[[t('adm_kpi_users'),db.users.length],[t('adm_kpi_profiles'),db.profiles.length],[t('adm_kpi_active_cards'),cnt('ACTIVE')],[t('adm_kpi_exhausted'),cs.filter(p=>credits(p)<=0).length],[t('adm_kpi_deactivated_cards'),cnt('DEACTIVATED')],[t('adm_kpi_successful_payments'),paid.length],[t('adm_kpi_revenue'),money(paid.reduce((a,x)=>a+x.amount,0))],[t('adm_kpi_scans'),db.scans.filter(s=>s.result!=='CALL_CLICK').length],[t('adm_kpi_calls'),db.scans.filter(s=>s.result==='CALL_CLICK').length]].map(([l,v])=>`<div class="card"><b>${v}</b><span class="muted small">${l}</span></div>`).join('')}</div>
      ${distKpis()}
      <p class="muted small">${t('adm_minimization_note')}</p>
-     <p class="small muted">${t('adm_local_only_note')} (${t('adm_tab_cards')}, ${t('adm_tab_scans')}, ${t('adm_tab_log')}, ${t('adm_tab_support')}, ${t('adm_tab_gateway')})</p>`,
+     <p class="small muted">${t('adm_local_only_note')} (${t('adm_tab_scans')}, ${t('adm_tab_log')}, ${t('adm_tab_support')}, ${t('adm_tab_gateway')})</p>`,
    users:()=>tbl([t('adm_th_account'),t('adm_th_role'),t('adm_th_status'),t('adm_th_registered'),t('adm_th_profiles'),''],db.users.map(u2=>[esc(userName(u2)+' · '+u2.ident),u2.role,u2.status==='suspended'?'<span class="chip bad">'+t('adm_suspended_chip')+'</span>':'<span class="chip ok">'+t('adm_active_chip')+'</span>',fmt(u2.createdAt),db.profiles.filter(p=>p.userId===u2.id).length,u2.id===u.id?'—':`<button class="btn sm sec" onclick="admSuspend('${u2.id}')">${u2.status==='suspended'?t('adm_reactivate_btn'):t('adm_suspend_btn')}</button>`])),
    cards:()=>tbl([t('adm_th_id'),t('adm_th_holder'),t('adm_th_status'),t('adm_th_version'),t('adm_th_credits_left'),''],cs.map(p=>[esc(p.card.publicId),esc(p.first+' '+p.last),chip(cardStatus(p)),p.card.version,credits(p),
-     `<div class="row"><button class="btn sm sec" onclick="admToggle('${p.id}')">${p.card.status==='DEACTIVATED'?t('adm_activate_btn'):t('adm_deactivate_btn')}</button><button class="btn sm sec" onclick="regenQR('${p.id}',true)">${t('adm_revoke_qr_btn')}</button><button class="btn sm sec" onclick="admGrant('${p.id}')">${tf('adm_grant_edits_btn',{N:EDITS})}</button></div>`])),
+     `<div class="row"><button class="btn sm sec" onclick="admToggle('${p.id}')">${p.card.status==='DEACTIVATED'?t('adm_activate_btn'):t('adm_deactivate_btn')}</button>${p._real?'':`<button class="btn sm sec" onclick="regenQR('${p.id}',true)">${t('adm_revoke_qr_btn')}</button>`}<button class="btn sm sec" onclick="admGrant('${p.id}')">${tf('adm_grant_edits_btn',{N:EDITS})}</button></div>`])),
    pay:()=>tbl([t('adm_th_ref'),t('adm_th_account'),t('adm_th_type'),t('adm_th_amount'),t('adm_th_method'),t('adm_th_provider'),t('adm_th_date'),t('adm_th_status')],db.payments.slice().reverse().map(x=>[x.id,esc((db.users.find(u2=>u2.id===x.userId)||{}).ident||'—'),x.kind==='topup'?tf('adm_topup_label',{N:EDITS}):t('adm_card_label'),money(x.amount),esc(x.method),x.provider,fmtT(x.createdAt),`<span class="chip ${x.status==='SUCCESS'?'ok':x.status==='PENDING'?'warn':'bad'}">${x.status}</span>`])),
    scans:()=>tbl([t('adm_th_date'),t('adm_th_card'),t('adm_th_result')],db.scans.slice().reverse().slice(0,200).map(s=>[fmtT(s.t),esc(s.card),s.result])),
    log:()=>tbl([t('adm_th_date'),t('adm_th_actor'),t('adm_th_action'),t('adm_th_resource')],db.audit.slice().reverse().slice(0,200).map(a=>[fmtT(a.t),esc(a.actor),a.action,esc(a.res)])),
@@ -1960,8 +1983,33 @@ async function admSuspend(id){
   }catch(e){toast(e.message||t('adm_invalid_value_toast'));render()}
 }
 function admMethod(id,on){const m=db.settings.methods;if(!on&&Object.values(m).filter(Boolean).length<=1){toast(t('adm_min_payment_toast'));render();return}m[id]=on?1:0;audit('admin','pay_method_'+id+'_'+(on?'on':'off'));save();render()}
-function admToggle(id){const p=getP(id);p.card.status=p.card.status==='DEACTIVATED'?'ACTIVE':'DEACTIVATED';audit('admin','card_'+p.card.status,id);save();render()}
-function admGrant(id){const p=getP(id);p.card.credits=credits(p)+EDITS;audit('admin','grant_edits',id);save();render()}
+// F-18 (2026-10-11) : admToggle/admGrant ne touchaient que l'objet local p.card — jamais la
+// vraie carte en base, puisque la carte venait désormais de syncAdminCards() (serveur) et non
+// plus d'une création locale. Sans cet appel à admin-api, le bouton semblait fonctionner (toggle
+// visible à l'écran) mais la prochaine synchronisation (changement d'onglet) aurait écrasé le
+// changement avec la vraie valeur serveur restée inchangée — même classe de bug que le lien de
+// recommandation (F-16) et la rétrogradation de rôle (F-17) : un état local qui n'est jamais
+// réellement persisté. Même principe que admSuspend() : _real → passe par admin-api ; sinon
+// (profil créé localement sans backend, cas hors-ligne) comportement local inchangé.
+async function admToggle(id){
+  const p=getP(id);if(!p||!p.card)return;
+  if(!p._real){p.card.status=p.card.status==='DEACTIVATED'?'ACTIVE':'DEACTIVATED';audit('admin','card_'+p.card.status,id);save();return render()}
+  const target=p.card.status==='DEACTIVATED'?'ACTIVE':'DEACTIVATED';
+  try{
+    const {card}=await supaAdmin('set_card_status',{profile_id:p.serverId||p.id,status:target});
+    if(card)p.card.status=card.status;
+    audit('admin','card_'+p.card.status,id);save();render();
+  }catch(e){toast(e.message||t('adm_invalid_value_toast'));render()}
+}
+async function admGrant(id){
+  const p=getP(id);if(!p||!p.card)return;
+  if(!p._real){p.card.credits=credits(p)+EDITS;audit('admin','grant_edits',id);save();return render()}
+  try{
+    const {card}=await supaAdmin('grant_card_edits',{profile_id:p.serverId||p.id,amount:EDITS});
+    if(card)p.card.credits=card.credits;
+    audit('admin','grant_edits',id);save();render();
+  }catch(e){toast(e.message||t('adm_invalid_value_toast'));render()}
+}
 
 /* ---------- Confidentialité & aide ---------- */
 function privacyView(){return `<div class="narrow"><h1 style="font-size:2rem">${t('legal_privacy_h1')}</h1>

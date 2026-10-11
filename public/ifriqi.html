@@ -433,6 +433,13 @@ const AuthBridge={
     }
     if(row.status==='suspended'){await sb.auth.signOut();throw new Error('suspended')}
     upsertLocalUser(mapAppUser(authUser,row));
+    // F-15 : db.session doit être positionné AVANT syncMyProfiles()/syncMyDistributor(), qui
+    // passent tous deux par me() (donc par db.session) pour savoir qui synchroniser. L'appelant
+    // (doAuth()) réaffecte la même valeur juste après le retour de cette fonction — sans effet,
+    // simplement pour ne pas changer son comportement existant.
+    db.session=authUser.id;
+    await Promise.all([syncMyProfiles(),syncDistributorAndFinance()]).catch(()=>null);
+    save();
     return authUser.id;
   },
   async signOut(){await sb.auth.signOut()},
@@ -443,7 +450,12 @@ const AuthBridge={
     const {data:row}=await sb.from('app_users').select('*').eq('id',authUser.id).maybeSingle();
     if(!row)return false;
     upsertLocalUser(mapAppUser(authUser,row));
-    db.session=authUser.id;save();
+    db.session=authUser.id;
+    // F-15 : resynchronise aussi profils/cartes + fiche distributeur ici, pour qu'un retour sur
+    // l'app (session déjà active, ex. après un rechargement de page) voie tout de suite le bon
+    // état de eligible()/myDist() — pas seulement après une nouvelle connexion explicite.
+    await Promise.all([syncMyProfiles(),syncDistributorAndFinance()]).catch(()=>null);
+    save();
     return true;
   },
   async verifyCurrentPassword(email,password){
@@ -498,6 +510,40 @@ async function syncMyDistributor(){
   if(error||!row)return null;
   const d={id:row.id,userId:row.user_id,code:row.code,status:row.status,referredBy:row.referred_by,activatedAt:msToLocal(Date.now(),row.activated_at)};
   return mergeById(db.distributors,row,d);
+}
+// F-15 (2026-10-11) : eligible() (plus bas) décide d'afficher "Créer mon lien de recommandation"
+// en cherchant un profil local avec une carte (p.card). Mais AVANT ce correctif, rien
+// n'allait jamais chercher les profils/cartes réels de l'utilisateur depuis Supabase — ils
+// n'existaient dans db.profiles QUE si la carte avait été achetée dans la même session
+// navigateur (doPay() les ajoute directement en mémoire). Sur un autre appareil, après un
+// stockage local vidé, ou simplement après un rechargement de la page suivi d'une reconnexion,
+// db.profiles restait vide même pour un utilisateur ayant réellement une carte ACTIVE en base :
+// eligible() renvoyait donc toujours faux, et le bouton semblait "ne pas exister". Cette
+// fonction répare ça en resynchronisant réellement profiles+cards depuis le serveur.
+async function syncMyProfiles(){
+  const u=me();if(!u)return [];
+  const {data:rows,error}=await sb.from('profiles').select('*, cards(*)').eq('user_id',u.id);
+  if(error||!rows)return [];
+  return rows.map(row=>{
+    const card=Array.isArray(row.cards)?row.cards[0]:row.cards;
+    // Fusionne sur serverId EN PLUS de id : un profil acheté dans cette même session garde un
+    // id local ('P'+uid(), voir newProfile()) distinct de serverId (l'UUID réel, voir doPay()).
+    // Fusionner seulement sur id créerait un doublon de ce même profil à la prochaine
+    // synchronisation (ex. rechargement de page) au lieu de mettre à jour l'entrée existante.
+    const existing=db.profiles.find(p=>p.id===row.id||p.serverId===row.id);
+    const mapped={
+      id:existing?existing.id:row.id,serverId:row.id,userId:row.user_id,type:row.type,
+      first:row.first_name||'',last:row.last_name||'',dob:row.dob||'',sex:row.sex||'',
+      address:row.address||'',photo:row.photo_url||null,
+      printContact:!!row.print_contact,printHealth:!!row.print_health,
+      contacts:row.contacts||[],health:row.health||{},
+      card:card?{publicId:card.public_id,token:card.pending_token||'',tokenHash:card.token_hash,status:card.status,version:card.version,createdAt:msToLocal(Date.now(),card.created_at),credits:card.credits,editsUsed:card.edits_used,revoked:[],countryCode:card.country_code||''}:null,
+      createdAt:msToLocal(Date.now(),row.created_at),
+    };
+    const i=db.profiles.findIndex(p=>p===existing);
+    if(i>=0)db.profiles[i]=mapped;else db.profiles.push(mapped);
+    return mapped;
+  });
 }
 async function syncDistributorAndFinance(){
   const d=await syncMyDistributor();

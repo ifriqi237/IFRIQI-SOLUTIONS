@@ -15,6 +15,7 @@
 //   grant_card_edits       { profile_id, amount }              -> crédite N éditions sur la carte
 //   list_commissions       { limit? }                         -> commissions + distributeur
 //   list_withdrawals       { status? }                        -> retraits + distributeur
+//   cancel_withdrawal      { withdrawal_id }                   -> REQUESTED/PROCESSING -> CANCELLED (secours, jamais -> PAID)
 //   list_users             { limit? }                         -> comptes
 //   list_scans             { limit? }                         -> journal des scans QR (table scans)
 //   list_audit_log         { limit? }                         -> journal des actions admin
@@ -203,6 +204,29 @@ Deno.serve(async (req) => {
           ? await svc.from("distributors").select("id,code,user_id").in("id", distIds)
           : { data: [] };
         return json({ withdrawals: (wds ?? []).map((w) => ({ ...w, distributor: (dists ?? []).find((d) => d.id === w.dist_id) ?? null })) });
+      }
+
+      // cancel_withdrawal : intervention de SECOURS uniquement, pour un retrait resté bloqué
+      // en PROCESSING sans jamais recevoir de callback PawaPay (incident réseau, panne, compte
+      // PawaPay mal configuré...). N'agit que sur REQUESTED/PROCESSING -> CANCELLED. Ne passe
+      // JAMAIS à PAID depuis cette fonction : seul pawapay-payout-callback, après confirmation
+      // serveur-à-serveur réelle de PawaPay, peut marquer un retrait payé. Le solde du
+      // distributeur redevient disponible automatiquement (la formule de claim_withdrawal()
+      // exclut CANCELLED/REJECTED), sans écriture ledger supplémentaire nécessaire.
+      case "cancel_withdrawal": {
+        const wdId = requireString(body.withdrawal_id, "withdrawal_id");
+        if (typeof wdId !== "string") return wdId;
+        const { data, error } = await svc
+          .from("withdrawals")
+          .update({ status: "CANCELLED" })
+          .eq("id", wdId)
+          .in("status", ["REQUESTED", "PROCESSING"])
+          .select()
+          .maybeSingle();
+        if (error) return dbError("cancel_withdrawal", error);
+        if (!data) return json({ error: "Ce retrait n'est plus en attente (déjà payé, rejeté ou annulé)." }, 409);
+        await logAudit(svc, user.id, "cancel_withdrawal", wdId);
+        return json({ withdrawal: data });
       }
 
       case "list_users": {

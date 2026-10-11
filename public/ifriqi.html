@@ -678,6 +678,16 @@ async function syncAdminWithdrawals(){
   const {withdrawals}=await supaAdmin('list_withdrawals',{});
   (withdrawals||[]).forEach(w=>mergeById(db.withdrawals,w,{id:w.id,seq:w.id,distId:w.dist_id,amount:w.amount_fcfa,method:w.method,account:w.account_ref,provider:w.provider,status:w.status,requestedAt:msToLocal(Date.now(),w.requested_at),processedAt:w.paid_at?msToLocal(Date.now(),w.paid_at):null,_real:true}));
 }
+// F-21 (2026-10-11) : l'onglet "Paiements" (distinct de "Ventes") et les KPIs "Paiements
+// réussis"/"Revenus" de l'Aperçu lisaient db.payments, un tableau jamais alimenté par aucune
+// synchronisation ni aucune écriture locale — vide depuis toujours, quel que soit le nombre de
+// paiements réellement réussis en base. Remplacement wholesale (même principe que
+// db.scans/db.audit/db.support) : aucune écriture locale ne nourrit db.payments, donc pas de
+// fusion par id nécessaire.
+async function syncAdminPayments(){
+  const {payments}=await supaAdmin('list_payments',{limit:300});
+  db.payments=(payments||[]).map(r=>({id:r.id,ident:r.customer_label||'—',kind:r.product==='topup'?'topup':'card',amount:r.amount_fcfa,method:r.method||'—',provider:r.provider,createdAt:msToLocal(Date.now(),r.created_at),status:r.status}));
+}
 // F-19/F-20 (2026-10-11) : db.scans/db.audit/db.support n'avaient jamais de source serveur —
 // on REMPLACE entièrement le tableau local à chaque sync (pas de fusion par id comme pour
 // profils/distributeurs : plus aucune écriture locale ne les alimente désormais, scanView(),
@@ -712,7 +722,7 @@ async function syncAdminTab(tab){
   // syncAdminScans() est dans le lot "toujours" (pas seulement onglet 'scans') car les
   // compteurs "Scans"/"Appels" de l'Aperçu en dépendent aussi — sinon ils resteraient à 0/périmés
   // tant que l'admin n'a pas cliqué sur l'onglet Scans dans la session en cours.
-  await Promise.all([syncAdminDistributors(),syncAdminCards(),syncAdminSettings(),syncAdminScans()]);
+  await Promise.all([syncAdminDistributors(),syncAdminCards(),syncAdminSettings(),syncAdminScans(),syncAdminPayments()]);
   if(tab==='orders')await syncAdminOrders();
   else if(tab==='comm')await syncAdminCommissions();
   else if(tab==='wd')await syncAdminWithdrawals();
@@ -2027,7 +2037,7 @@ async function adminView(){
    users:()=>tbl([t('adm_th_account'),t('adm_th_role'),t('adm_th_status'),t('adm_th_registered'),t('adm_th_profiles'),''],db.users.map(u2=>[esc(userName(u2)+' · '+u2.ident),u2.role,u2.status==='suspended'?'<span class="chip bad">'+t('adm_suspended_chip')+'</span>':'<span class="chip ok">'+t('adm_active_chip')+'</span>',fmt(u2.createdAt),db.profiles.filter(p=>p.userId===u2.id).length,u2.id===u.id?'—':`<button class="btn sm sec" onclick="admSuspend('${u2.id}')">${u2.status==='suspended'?t('adm_reactivate_btn'):t('adm_suspend_btn')}</button>`])),
    cards:()=>tbl([t('adm_th_id'),t('adm_th_holder'),t('adm_th_status'),t('adm_th_version'),t('adm_th_credits_left'),''],cs.map(p=>[esc(p.card.publicId),esc(p.first+' '+p.last),chip(cardStatus(p)),p.card.version,credits(p),
      `<div class="row"><button class="btn sm sec" onclick="admToggle('${p.id}')">${p.card.status==='DEACTIVATED'?t('adm_activate_btn'):t('adm_deactivate_btn')}</button>${p._real?'':`<button class="btn sm sec" onclick="regenQR('${p.id}',true)">${t('adm_revoke_qr_btn')}</button>`}<button class="btn sm sec" onclick="admGrant('${p.id}')">${tf('adm_grant_edits_btn',{N:EDITS})}</button></div>`])),
-   pay:()=>tbl([t('adm_th_ref'),t('adm_th_account'),t('adm_th_type'),t('adm_th_amount'),t('adm_th_method'),t('adm_th_provider'),t('adm_th_date'),t('adm_th_status')],db.payments.slice().reverse().map(x=>[x.id,esc((db.users.find(u2=>u2.id===x.userId)||{}).ident||'—'),x.kind==='topup'?tf('adm_topup_label',{N:EDITS}):t('adm_card_label'),money(x.amount),esc(x.method),x.provider,fmtT(x.createdAt),`<span class="chip ${x.status==='SUCCESS'?'ok':x.status==='PENDING'?'warn':'bad'}">${x.status}</span>`])),
+   pay:()=>tbl([t('adm_th_ref'),t('adm_th_account'),t('adm_th_type'),t('adm_th_amount'),t('adm_th_method'),t('adm_th_provider'),t('adm_th_date'),t('adm_th_status')],db.payments.slice().reverse().map(x=>[x.id,esc(x.ident||'—'),x.kind==='topup'?tf('adm_topup_label',{N:EDITS}):t('adm_card_label'),money(x.amount),esc(x.method),x.provider,fmtT(x.createdAt),`<span class="chip ${x.status==='SUCCESS'?'ok':x.status==='PENDING'?'warn':'bad'}">${x.status}</span>`])),
    scans:()=>tbl([t('adm_th_date'),t('adm_th_card'),t('adm_th_result')],db.scans.slice().reverse().slice(0,200).map(s=>[fmtT(s.t),esc(s.card),s.result])),
    log:()=>tbl([t('adm_th_date'),t('adm_th_actor'),t('adm_th_action'),t('adm_th_resource')],db.audit.slice().reverse().slice(0,200).map(a=>[fmtT(a.t),esc(a.actor),a.action,esc(a.res)])),
    support:()=>tbl([t('adm_th_date'),t('adm_th_category'),t('adm_th_contact'),t('adm_th_message')],db.support.slice().reverse().map(s=>[fmtT(s.t),esc(s.cat),esc(s.contact),esc(s.msg)])),

@@ -14,6 +14,7 @@
 //   set_card_status        { profile_id, status }             -> ACTIVE <-> DEACTIVATED
 //   grant_card_edits       { profile_id, amount }              -> crédite N éditions sur la carte
 //   list_commissions       { limit? }                         -> commissions + distributeur
+//   list_payments          { limit? }                         -> paiements réels (table payments) + commande/client
 //   list_withdrawals       { status? }                        -> retraits + distributeur
 //   cancel_withdrawal      { withdrawal_id }                   -> REQUESTED/PROCESSING -> CANCELLED (secours, jamais -> PAID)
 //   list_users             { limit? }                         -> comptes
@@ -191,6 +192,41 @@ Deno.serve(async (req) => {
           ? await svc.from("distributors").select("id,code,user_id").in("id", distIds)
           : { data: [] };
         return json({ commissions: (comms ?? []).map((c) => ({ ...c, distributor: (dists ?? []).find((d) => d.id === c.dist_id) ?? null })) });
+      }
+
+      // F-21 (2026-10-11) : l'onglet "Paiements" du panneau admin (distinct de "Ventes", qui lit
+      // `orders`) lisait db.payments côté frontend — un tableau jamais alimenté par aucune
+      // synchronisation ni aucune écriture locale, donc vide depuis toujours. Les KPIs "Paiements
+      // réussis"/"Revenus" de l'Aperçu lisaient ce même tableau vide. Résultat concret signalé par
+      // l'utilisateur : un paiement réellement réussi (table `payments`, status='SUCCESS') ce
+      // matin n'apparaissait nulle part dans cet onglet, ni dans les KPIs. Corrigé en lisant
+      // réellement la table `payments`.
+      case "list_payments": {
+        const limit = clampLimit(body.limit, 200, 500);
+        const { data: pays, error } = await svc
+          .from("payments")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(limit);
+        if (error) return dbError("list_payments", error);
+        const orderIds = [...new Set((pays ?? []).map((p) => p.order_id).filter(Boolean))];
+        const { data: orders } = orderIds.length
+          ? await svc.from("orders").select("id,product,customer_id").in("id", orderIds)
+          : { data: [] };
+        const customerIds = [...new Set((orders ?? []).map((o) => o.customer_id).filter(Boolean))];
+        const { data: customers } = customerIds.length
+          ? await svc.from("app_users").select("id,first_name,last_name,email,phone").in("id", customerIds)
+          : { data: [] };
+        return json({
+          payments: (pays ?? []).map((p) => {
+            const o = (orders ?? []).find((x) => x.id === p.order_id) ?? null;
+            const c = o ? (customers ?? []).find((x) => x.id === o.customer_id) ?? null : null;
+            const label = c
+              ? (((c.first_name || "") + " " + (c.last_name || "")).trim() || c.email || c.phone || "")
+              : "";
+            return { ...p, product: o?.product ?? null, customer_label: label };
+          }),
+        });
       }
 
       case "list_withdrawals": {

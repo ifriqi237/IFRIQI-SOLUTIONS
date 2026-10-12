@@ -1,0 +1,215 @@
+// Helpers partagés pour l'intégration iKeePay (mode H2H — Mobile Money), 2026-10-12.
+//
+// Ce module suit EXACTEMENT ce que la documentation iKeePay fournie par l'utilisateur décrit,
+// et rien de plus : aucun endpoint, paramètre ou comportement n'est deviné. Chaque fonction
+// cite la section de la doc dont elle vient. Là où la doc est silencieuse ou ambiguë, c'est
+// noté explicitement en commentaire — voir en particulier verifyIkeepayWebhookSignature()
+// ci-dessous, qui N'EST PAS complète (point bloquant signalé, pas contourné).
+//
+// Variables d'environnement attendues (Project Settings → Edge Functions → Secrets) :
+//   IKEEPAY_API_BASE_URL     — défaut "https://api.ikeepay.com" (doc : "Endpoint Live")
+//   IKEEPAY_SECRET_KEY        — clé secrète H2H (en-tête x-api-key sur /h2h-payin, /h2h-payout,
+//                                /h2h-verify). Indépendante de PAWAPAY_API_TOKEN.
+//   IKEEPAY_WEBHOOK_SECRET    — secret utilisé pour calculer X-ikeepay-signature (HMAC-SHA256,
+//                                confirmé par le support iKeePay). ⚠️ NON CONFIRMÉ à ce jour :
+//                                ni la valeur exacte de ce secret (= IKEEPAY_SECRET_KEY ou un
+//                                secret distinct ?), ni ce qui est signé (corps brut vs champs
+//                                concaténés), ni l'encodage (hex vs base64). Tant que ce n'est
+//                                pas confirmé par le support, verifyIkeepayWebhookSignature()
+//                                refuse TOUJOURS le callback (fail-safe : on ne traite jamais
+//                                une notification qu'on ne peut pas authentifier).
+//   IKEEPAY_REQUIRE_SIGNATURE — "false" pour désactiver la vérification PENDANT LES TESTS
+//                                SANDBOX UNIQUEMENT (même principe que PAWAPAY_REQUIRE_SIGNATURE
+//                                dans pawapay.ts). Ne jamais mettre à "false" en production.
+
+export function ikeepayApiBase(): string {
+  return Deno.env.get("IKEEPAY_API_BASE_URL") || "https://api.ikeepay.com";
+}
+
+function ikeepayAuthHeaders(): Record<string, string> {
+  const key = Deno.env.get("IKEEPAY_SECRET_KEY");
+  return key ? { "x-api-key": key } : {};
+}
+
+export function ikeepayConfigured(): boolean {
+  return !!Deno.env.get("IKEEPAY_SECRET_KEY");
+}
+
+// ---------------------------------------------------------------------------
+// 1. Encaissement (Payin) — POST /h2h-payin.
+// Doc : section "Intégration H2H (Payin, Payout & Webhooks)" → "1. Encaissement (Payin)".
+//
+// ⚠️ GAP DE DOCUMENTATION (signalé, non deviné) : la doc montre le payload envoyé et le webhook
+// reçu PLUS TARD, mais ne montre PAS la forme de la réponse HTTP synchrone de cet endpoint (ni
+// en succès, ni en erreur). On lit donc la réponse de façon défensive (plusieurs noms de champs
+// plausibles) et on conserve `raw` intégralement pour diagnostic — mais tant que le support n'a
+// pas confirmé le format exact, ce parsing peut être incomplet. Ne JAMAIS considérer cet appel
+// seul comme une preuve de paiement : voir verifyTransaction() plus bas, appelée par le webhook
+// avant toute écriture en base.
+// ---------------------------------------------------------------------------
+
+export type IkeepayPayinParams = {
+  amount: number;                 // montant — la doc donne des entiers (500, 5000) selon la devise
+  currency: string;                // ex. "XOF"
+  country: string;                 // code pays ISO2, ex. "CI"
+  phoneNumber: string;              // ex. "2250700000000" (indicatif inclus, sans "+")
+  operator: string;                 // "ORANGE" | "MTN" | "WAVE" | "MOOV" | "MOBICASH" | "AIRTEL" | "VODACOM" | ...
+  externalReference: string;        // généré côté serveur, jamais par le client
+  customerEmail?: string;
+  otp?: string;                     // requis pour certains opérateurs (ex. Orange BF) — flux de soumission du
+                                     // second facteur non détaillé par la doc ; voir gap signalé au rapport final.
+};
+
+export type IkeepayPayinResult =
+  | { ok: true; raw: unknown; paymentLink?: string | null }
+  | { ok: false; raw: unknown; httpStatus?: number; message?: string };
+
+export async function initiatePayin(params: IkeepayPayinParams): Promise<IkeepayPayinResult> {
+  const body = {
+    amount: params.amount,
+    currency: params.currency,
+    country: params.country,
+    phoneNumber: params.phoneNumber,
+    operator: params.operator,
+    external_reference: params.externalReference,
+    ...(params.customerEmail ? { customer_email: params.customerEmail } : {}),
+    ...(params.otp ? { otp: params.otp } : {}),
+  };
+  const res = await fetch(`${ikeepayApiBase()}/h2h-payin`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...ikeepayAuthHeaders() },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    console.error("iKeePay initiatePayin HTTP error", res.status, data);
+    return { ok: false, raw: data, httpStatus: res.status, message: data?.message ?? data?.error ?? undefined };
+  }
+  // La doc mentionne : "Vous recevrez un lien de redirection payment_link en réponse pour le cas
+  // de Wave et Orange si nécessaire" — on l'extrait si présent, sans supposer sa présence.
+  const paymentLink = data?.payment_link ?? data?.data?.payment_link ?? null;
+  return { ok: true, raw: data, paymentLink };
+}
+
+// ---------------------------------------------------------------------------
+// 2. Retrait (Payout) — POST /h2h-payout. Fourni pour complétude (doc "2. Retrait (Payout)"),
+// mais PAS branché sur request-withdrawal/index.ts dans cette intervention : le cahier des
+// charges porte sur l'intégration du paiement (encaissement), et toucher le flux de retrait
+// distributeur (déjà opérationnel avec PawaPay) serait hors du périmètre demandé. À brancher
+// séparément si un jour IFRIQI veut proposer iKeePay comme option de retrait aussi.
+// ---------------------------------------------------------------------------
+
+export type IkeepayPayoutParams = {
+  amount: number;
+  currency: string;
+  country: string;
+  phoneNumber: string;
+  operator: string;
+  externalReference: string;
+};
+
+export async function initiatePayout(params: IkeepayPayoutParams): Promise<IkeepayPayinResult> {
+  const body = {
+    amount: params.amount,
+    currency: params.currency,
+    country: params.country,
+    phoneNumber: params.phoneNumber,
+    operator: params.operator,
+    external_reference: params.externalReference,
+  };
+  const res = await fetch(`${ikeepayApiBase()}/h2h-payout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...ikeepayAuthHeaders() },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    console.error("iKeePay initiatePayout HTTP error", res.status, data);
+    return { ok: false, raw: data, httpStatus: res.status, message: data?.message ?? data?.error ?? undefined };
+  }
+  return { ok: true, raw: data };
+}
+
+// ---------------------------------------------------------------------------
+// 3. Vérification de transaction — GET /h2h-verify/:reference.
+// Doc : "3. Vérification de transaction". Réponse confirmée par la doc :
+//   { status: "success", data: { external_reference, provider_reference, amount, currency,
+//     status: "completed"|"pending"|"failed", type: "payin"|"payout", operator, created_at } }
+//
+// Appelée par ikeepay-webhook AVANT d'écrire quoi que ce soit en base — on ne fait jamais
+// confiance au `status` porté par le webhook seul, exactement le même principe que
+// checkDepositStatus() dans pawapay.ts.
+// ---------------------------------------------------------------------------
+
+export type IkeepayVerifyResult = {
+  found: boolean;
+  status: "completed" | "pending" | "failed" | "cancelled" | "unknown";
+  raw: unknown;
+  data?: {
+    external_reference: string;
+    provider_reference: string;
+    amount: number;
+    currency: string;
+    type: "payin" | "payout";
+    operator: string;
+    created_at: string;
+  };
+};
+
+export async function verifyTransaction(reference: string): Promise<IkeepayVerifyResult> {
+  const res = await fetch(`${ikeepayApiBase()}/h2h-verify/${encodeURIComponent(reference)}`, {
+    headers: ikeepayAuthHeaders(),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    console.error("iKeePay verifyTransaction HTTP error", res.status, data);
+    return { found: false, status: "unknown", raw: data };
+  }
+  const status = data?.data?.status;
+  if (status === "completed" || status === "pending" || status === "failed" || status === "cancelled") {
+    return { found: true, status, raw: data, data: data.data };
+  }
+  return { found: false, status: "unknown", raw: data };
+}
+
+// ---------------------------------------------------------------------------
+// Vérification de signature des webhooks — X-ikeepay-signature, HMAC-SHA256 (confirmé par le
+// support iKeePay, 2026-10-12).
+//
+// ⚠️ POINT BLOQUANT (signalé explicitement, conformément au cahier des charges — "n'invente
+// aucun format de signature") : le support a confirmé l'ALGORITHME (HMAC-SHA256) et l'EN-TÊTE
+// (X-ikeepay-signature), mais PAS encore :
+//   1. quel secret alimente le HMAC (IKEEPAY_SECRET_KEY, ou un IKEEPAY_WEBHOOK_SECRET distinct) ;
+//   2. ce qui est exactement signé (le corps brut de la requête, ou des champs concaténés dans
+//      un ordre précis) ;
+//   3. l'encodage du résultat (hex ou base64).
+//
+// Tant que ces 3 points ne sont pas confirmés, cette fonction refuse TOUJOURS le webhook
+// (fail-safe) plutôt que de deviner un schéma qui pourrait soit (a) rejeter de vrais paiements,
+// soit pire (b) laisser passer une notification falsifiée si la supposition était la bonne par
+// coïncidence mais le reste du calcul faux. Dès que le support confirme les 3 points, remplacer
+// le corps de cette fonction par le calcul réel — la structure (lire l'en-tête, recalculer,
+// comparer en temps constant) est déjà prête ci-dessous en commentaire.
+// ---------------------------------------------------------------------------
+
+export type IkeepaySignatureVerification = { ok: boolean; reason?: string };
+
+export async function verifyIkeepayWebhookSignature(req: Request, _rawBody: Uint8Array): Promise<IkeepaySignatureVerification> {
+  const sig = req.headers.get("x-ikeepay-signature");
+  if (!sig) return { ok: false, reason: "En-tête X-ikeepay-signature absent." };
+
+  // Implémentation réelle à activer dès confirmation du support (secret exact + ce qui est
+  // signé + encodage) :
+  //
+  //   const secret = Deno.env.get("IKEEPAY_WEBHOOK_SECRET")!;
+  //   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret),
+  //     { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  //   const mac = await crypto.subtle.sign("HMAC", key, _rawBody); // ou les champs concaténés
+  //   const expected = toHex(mac); // ou toBase64(mac), selon confirmation
+  //   return timingSafeEqual(expected, sig) ? { ok: true } : { ok: false, reason: "signature invalide" };
+
+  return {
+    ok: false,
+    reason: "Vérification HMAC non implémentée : secret/champs signés/encodage non confirmés par le support iKeePay.",
+  };
+}

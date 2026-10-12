@@ -8,6 +8,7 @@
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient, userClient } from "../_shared/supabase.ts";
 import { initiateDeposit, getActiveConfiguration } from "../_shared/pawapay.ts";
+import { initiatePayin as ikeepayInitiatePayin, ikeepayConfigured } from "../_shared/ikeepay.ts";
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -20,15 +21,20 @@ Deno.serve(async (req) => {
     }
 
     const body = await req.json();
-    const { profileId, product, refCode, method, phone, pawapayProvider } = body as {
+    const { profileId, product, refCode, method, phone, pawapayProvider, ikeepayOperator, ikeepayCountry } = body as {
       profileId: string; product: "card" | "topup"; refCode?: string; method: string; phone?: string;
       pawapayProvider?: string; // requis si method === 'pawapay' — code fournisseur PawaPay, ex. "MTN_MOMO_BEN"
+      ikeepayOperator?: string; // requis si method === 'ikeepay' — ex. "ORANGE", "MTN", "WAVE"...
+      ikeepayCountry?: string;  // requis si method === 'ikeepay' — code pays ISO2, ex. "CI"
     };
     if (!profileId || !["card", "topup"].includes(product)) {
       return json({ error: "profileId et product ('card'|'topup') sont requis." }, 400);
     }
     if (method === "pawapay" && (!phone || !pawapayProvider)) {
       return json({ error: "phone et pawapayProvider sont requis pour un paiement PawaPay." }, 400);
+    }
+    if (method === "ikeepay" && (!phone || !ikeepayOperator || !ikeepayCountry)) {
+      return json({ error: "phone, ikeepayOperator et ikeepayCountry sont requis pour un paiement iKeePay." }, 400);
     }
 
     const svc = serviceClient();
@@ -72,11 +78,13 @@ Deno.serve(async (req) => {
     if (orderErr) { console.error("create-order insert error", orderErr); return json({ error: "Impossible de créer la commande pour le moment." }, 500); }
 
     // ---- Initiation du paiement chez le prestataire ----
-    const provider = method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : "cinetpay";
+    const provider = method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : method === "ikeepay" ? "ikeepay" : "cinetpay";
     const init = provider === "paypal"
       ? await initPaypal(order.id, priceFcfa)
       : provider === "pawapay"
       ? await initPawapay(order.id, displayAmount, currency, phone!, pawapayProvider!)
+      : provider === "ikeepay"
+      ? await initIkeepay(order.id, displayAmount, currency, phone!, ikeepayOperator!, ikeepayCountry!)
       : await initCinetpay(order.id, priceFcfa, method, phone);
 
     // Si l'initiation a été rejetée immédiatement par le prestataire (ex. opérateur PawaPay
@@ -201,6 +209,50 @@ async function initPawapay(orderId: string, displayAmount: number, currency: str
   }
 
   return { reference: depositId, raw: result.raw, client: { depositId, status: result.status, message: "Paiement PawaPay initié. Validez la demande sur votre téléphone." } };
+}
+
+// ---------------------------------------------------------------------------
+// iKeePay (mode H2H, Mobile Money), ajouté le 2026-10-12 EN PLUS de PawaPay (ne remplace rien).
+// Nécessite IKEEPAY_SECRET_KEY. Comme pour PawaPay, pas de mode "sandbox implicite" ici : sans
+// la clé, on refuse plutôt que de simuler un appel qui produirait une erreur HTTP confuse.
+//
+// Le statut renvoyé ici (succès de l'appel HTTP /h2h-payin) ne signifie PAS que le paiement est
+// confirmé : seul ikeepay-webhook/index.ts, après revérification serveur-à-serveur via
+// GET /h2h-verify/:reference, fait passer orders.payment_status à 'PAID'. Tant que le webhook
+// n'est pas reçu ET que la vérification de signature n'est pas finalisée (voir _shared/ikeepay.ts),
+// orders.payment_status reste 'PENDING' — c'est voulu, et ça restera le cas en production tant
+// que le support iKeePay n'a pas confirmé le schéma exact de signature des webhooks.
+// ---------------------------------------------------------------------------
+async function initIkeepay(orderId: string, displayAmount: number, currency: string, phone: string, operator: string, country: string) {
+  if (!ikeepayConfigured()) {
+    return { reference: null, raw: { sandbox: true }, client: { sandbox: true, message: "IKEEPAY_SECRET_KEY non configurée : paiement iKeePay indisponible pour le moment." }, skipPayment: true };
+  }
+  const externalReference = crypto.randomUUID();
+  const phoneDigits = phone.replace(/[^0-9]/g, "").replace(/^0+/, "");
+
+  const result = await ikeepayInitiatePayin({
+    amount: Math.round(displayAmount * 100) / 100,
+    currency,
+    country,
+    phoneNumber: phoneDigits,
+    operator,
+    externalReference,
+  });
+
+  if (!result.ok) {
+    console.error("create-order: initiatePayin iKeePay rejetée", result);
+    return { reference: externalReference, raw: result.raw, client: { error: result.message ?? "Paiement iKeePay refusé." }, skipPayment: true };
+  }
+
+  return {
+    reference: externalReference,
+    raw: result.raw,
+    client: {
+      externalReference,
+      paymentLink: result.paymentLink ?? null,
+      message: "Paiement iKeePay initié. Validez la demande sur votre téléphone (ou suivez le lien fourni selon l'opérateur).",
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

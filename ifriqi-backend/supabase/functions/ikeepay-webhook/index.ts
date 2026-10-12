@@ -31,6 +31,21 @@ Deno.serve(async (req) => {
 
   const rawBody = new Uint8Array(await req.arrayBuffer());
 
+  // ---------------------------------------------------------------------------
+  // CAPTURE DE DIAGNOSTIC TEMPORAIRE (2026-10-12) — à retirer une fois le schéma de signature
+  // confirmé. Objectif : voir EXACTEMENT ce qu'iKeePay envoie sur un vrai webhook (tous les
+  // en-têtes + le corps brut), pour pouvoir calculer plusieurs HMAC candidats (différents
+  // secrets/encodages) côté serveur et les comparer à la valeur reçue, au lieu de deviner.
+  // N'expose aucun secret : on ne journalise que ce qu'iKeePay nous envoie lui-même.
+  // Actif uniquement si IKEEPAY_DEBUG_CAPTURE=true (pour ne pas polluer les logs en continu).
+  // ---------------------------------------------------------------------------
+  if (Deno.env.get("IKEEPAY_DEBUG_CAPTURE") === "true") {
+    const allHeaders: Record<string, string> = {};
+    for (const [k, v] of req.headers.entries()) allHeaders[k] = v;
+    console.log("IKEEPAY_DEBUG_CAPTURE headers=", JSON.stringify(allHeaders));
+    console.log("IKEEPAY_DEBUG_CAPTURE rawBody=", new TextDecoder().decode(rawBody));
+  }
+
   try {
     const requireSignature = Deno.env.get("IKEEPAY_REQUIRE_SIGNATURE") !== "false";
     if (requireSignature) {

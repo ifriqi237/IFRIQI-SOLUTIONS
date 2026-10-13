@@ -36,6 +36,53 @@ export function ikeepayConfigured(): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Inline Checkout (modale pop-up unifiée), ajouté le 2026-10-13 — mode alternatif au H2H
+// ci-dessus, utilisé EN ATTENDANT que le palier "Direct Charge (Server-to-Server) / PRO" du
+// compte iKeePay soit débloqué (H2H renvoie 403 "Accès refusé" tant que ce palier n'est pas
+// activé — voir l'échange avec l'utilisateur, 2026-10-12/13).
+//
+// Principe (doc utilisateur + fichier de démo officiel `Demo.html` fourni, et plugin WooCommerce
+// officiel iKeePay inspecté pour référence) : le NAVIGATEUR charge directement
+// `${IKEEPAY_CHECKOUT_URL}?pk=...&amount=...&currency=...&order_id=...&email=...` dans une
+// iframe. L'utilisateur y choisit lui-même son moyen de paiement (carte, Mobile Money, virement,
+// USDT) ; iKeePay poste ensuite un message `window.postMessage` ('ikeepay-ready' | 'ikeepay-close'
+// | 'ikeepay-success' | 'ikeepay-error') à la page parente.
+//
+// ⚠️ ÉCART VOLONTAIRE PAR RAPPORT AU PLUGIN WOOCOMMERCE OFFICIEL D'IKEEPAY : ce plugin transmet
+// AUSSI la clé SECRÈTE au navigateur (`sk=...` dans l'URL de l'iframe) et valide la commande
+// uniquement sur la réception du message client `ikeepay-success` — sans aucune revérification
+// serveur-à-serveur. C'est un anti-pattern de sécurité (clé secrète exposée côté client +
+// confirmation de paiement qui ne tient qu'à un `postMessage`, qu'un attrapeur de console peut
+// envoyer lui-même). On ne le reproduit PAS ici :
+//   1. Seule la clé PUBLIQUE (`IKEEPAY_PUBLIC_KEY`, pk_live_...) part vers le navigateur.
+//   2. `ikeepay-success` ne fait JAMAIS passer une commande à PAID côté serveur — ce n'est qu'un
+//      signal UI (fermer la modale, démarrer le sondage normal de orders.payment_status, déjà en
+//      place pour PawaPay/H2H). La confirmation réelle doit toujours venir d'un canal
+//      serveur-à-serveur (webhook, ou vérification), exactement comme pour le H2H ci-dessus.
+//
+// ⚠️ GAP DE DOCUMENTATION (signalé, non deviné) : ni la doc utilisateur ni le `Demo.html` fourni
+// ne précisent SI iKeePay envoie un webhook pour les transactions Inline Checkout (et avec quel
+// format), ni si GET /h2h-verify/:reference couvre aussi ce type de transaction. Tant que ce
+// point n'est pas confirmé par le support iKeePay, une commande payée via Inline Checkout peut
+// rester bloquée à PENDING côté IFRIQI même si le client a réellement payé — c'est un risque
+// connu et accepté par l'utilisateur (2026-10-13), pas un bug caché.
+export function ikeepayPublicKey(): string | undefined {
+  return Deno.env.get("IKEEPAY_PUBLIC_KEY") || undefined;
+}
+
+export function ikeepayCheckoutUrl(): string {
+  // Valeur par défaut = exactement celle du fichier `Demo.html` officiel fourni par l'utilisateur
+  // (avec "www."). Le plugin WooCommerce officiel utilise une variante sans "www." : les deux
+  // n'ont pas été confirmées équivalentes par le support, donc IKEEPAY_CHECKOUT_URL permet de
+  // basculer sans redéploiement si la valeur par défaut s'avère incorrecte.
+  return Deno.env.get("IKEEPAY_CHECKOUT_URL") || "https://www.ikeepay.com/checkout/v1/inline";
+}
+
+export function ikeepayInlineConfigured(): boolean {
+  return !!ikeepayPublicKey();
+}
+
+// ---------------------------------------------------------------------------
 // 1. Encaissement (Payin) — POST /h2h-payin.
 // Doc : section "Intégration H2H (Payin, Payout & Webhooks)" → "1. Encaissement (Payin)".
 //

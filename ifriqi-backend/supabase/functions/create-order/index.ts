@@ -8,7 +8,7 @@
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient, userClient } from "../_shared/supabase.ts";
 import { initiateDeposit, getActiveConfiguration } from "../_shared/pawapay.ts";
-import { initiatePayin as ikeepayInitiatePayin, ikeepayConfigured } from "../_shared/ikeepay.ts";
+import { initiatePayin as ikeepayInitiatePayin, ikeepayConfigured, ikeepayPublicKey, ikeepayCheckoutUrl, ikeepayInlineConfigured } from "../_shared/ikeepay.ts";
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -24,8 +24,8 @@ Deno.serve(async (req) => {
     const { profileId, product, refCode, method, phone, pawapayProvider, ikeepayOperator, ikeepayCountry } = body as {
       profileId: string; product: "card" | "topup"; refCode?: string; method: string; phone?: string;
       pawapayProvider?: string; // requis si method === 'pawapay' — code fournisseur PawaPay, ex. "MTN_MOMO_BEN"
-      ikeepayOperator?: string; // requis si method === 'ikeepay' — ex. "ORANGE", "MTN", "WAVE"...
-      ikeepayCountry?: string;  // requis si method === 'ikeepay' — code pays ISO2, ex. "CI"
+      ikeepayOperator?: string; // requis si method === 'ikeepay' (Direct Charge/H2H) — ex. "ORANGE", "MTN", "WAVE"...
+      ikeepayCountry?: string;  // requis si method === 'ikeepay' (Direct Charge/H2H) — code pays ISO2, ex. "CI"
     };
     if (!profileId || !["card", "topup"].includes(product)) {
       return json({ error: "profileId et product ('card'|'topup') sont requis." }, 400);
@@ -33,8 +33,12 @@ Deno.serve(async (req) => {
     if (method === "pawapay" && (!phone || !pawapayProvider)) {
       return json({ error: "phone et pawapayProvider sont requis pour un paiement PawaPay." }, 400);
     }
+    // 'ikeepay' = Direct Charge / H2H (bloqué pour l'instant, palier PRO non débloqué sur le
+    // compte — voir _shared/ikeepay.ts). 'ikeepay_inline' = Inline Checkout (modale pop-up),
+    // mode actif choisi par l'utilisateur le 2026-10-13 en attendant ce déblocage. Les deux
+    // cohabitent dans le code ; seul 'ikeepay_inline' est branché côté front pour l'instant.
     if (method === "ikeepay" && (!phone || !ikeepayOperator || !ikeepayCountry)) {
-      return json({ error: "phone, ikeepayOperator et ikeepayCountry sont requis pour un paiement iKeePay." }, 400);
+      return json({ error: "phone, ikeepayOperator et ikeepayCountry sont requis pour un paiement iKeePay (Direct Charge)." }, 400);
     }
 
     const svc = serviceClient();
@@ -78,13 +82,15 @@ Deno.serve(async (req) => {
     if (orderErr) { console.error("create-order insert error", orderErr); return json({ error: "Impossible de créer la commande pour le moment." }, 500); }
 
     // ---- Initiation du paiement chez le prestataire ----
-    const provider = method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : method === "ikeepay" ? "ikeepay" : "cinetpay";
+    const provider = method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : (method === "ikeepay" || method === "ikeepay_inline") ? "ikeepay" : "cinetpay";
     const init = provider === "paypal"
       ? await initPaypal(order.id, priceFcfa)
       : provider === "pawapay"
       ? await initPawapay(order.id, displayAmount, currency, phone!, pawapayProvider!)
       : provider === "ikeepay"
-      ? await initIkeepay(order.id, displayAmount, currency, phone!, ikeepayOperator!, ikeepayCountry!)
+      ? (method === "ikeepay_inline"
+          ? initIkeepayInline(displayAmount, currency, user.email ?? "")
+          : await initIkeepay(order.id, displayAmount, currency, phone!, ikeepayOperator!, ikeepayCountry!))
       : await initCinetpay(order.id, priceFcfa, method, phone);
 
     // Si l'initiation a été rejetée immédiatement par le prestataire (ex. opérateur PawaPay
@@ -251,6 +257,37 @@ async function initIkeepay(orderId: string, displayAmount: number, currency: str
       externalReference,
       paymentLink: result.paymentLink ?? null,
       message: "Paiement iKeePay initié. Validez la demande sur votre téléphone (ou suivez le lien fourni selon l'opérateur).",
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// iKeePay — Inline Checkout (modale pop-up), ajouté le 2026-10-13. Mode ACTIF côté front en
+// attendant le déblocage du palier Direct Charge/PRO (voir commentaire détaillé dans
+// _shared/ikeepay.ts : ikeepayPublicKey()/ikeepayCheckoutUrl()).
+//
+// Contrairement à initIkeepay() (H2H) ci-dessus, cette fonction ne fait AUCUN appel HTTP vers
+// iKeePay : c'est le NAVIGATEUR du client qui charge l'iframe de paiement directement avec la
+// clé publique. On se contente ici de générer la référence et de renvoyer au front ce qu'il lui
+// faut pour ouvrir cette iframe. Nécessite IKEEPAY_PUBLIC_KEY (distincte de IKEEPAY_SECRET_KEY,
+// qui ne doit jamais quitter le serveur).
+// ---------------------------------------------------------------------------
+function initIkeepayInline(displayAmount: number, currency: string, email: string) {
+  if (!ikeepayInlineConfigured()) {
+    return { reference: null, raw: { sandbox: true }, client: { sandbox: true, message: "IKEEPAY_PUBLIC_KEY non configurée : paiement iKeePay (Inline Checkout) indisponible pour le moment." }, skipPayment: true };
+  }
+  const reference = crypto.randomUUID();
+  return {
+    reference,
+    raw: { mode: "inline_checkout" },
+    client: {
+      ikeepayReference: reference,
+      ikeepayPublicKey: ikeepayPublicKey(),
+      ikeepayCheckoutUrl: ikeepayCheckoutUrl(),
+      ikeepayAmount: Math.round(displayAmount * 100) / 100,
+      ikeepayCurrency: currency,
+      ikeepayEmail: email,
+      message: "Une fenêtre sécurisée iKeePay va s'ouvrir pour finaliser le paiement.",
     },
   };
 }

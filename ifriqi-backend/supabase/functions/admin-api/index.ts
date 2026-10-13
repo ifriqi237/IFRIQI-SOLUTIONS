@@ -28,6 +28,9 @@
 //   suspend_user           { user_id }                        -> active -> suspended
 //   reactivate_user        { user_id }                        -> suspended -> active
 //   update_settings        { price_fcfa?, ..., payment_methods?, payout_methods? } -> settings (id=1)
+//   recheck_ikeepay_payment { payment_id }                      -> revérifie un paiement iKeePay
+//                                                                   PENDING via GET /h2h-verify
+//                                                                   (audit 2026-10-13, voir plus bas)
 //
 // Principes de sécurité (mêmes que refund-order/request-withdrawal) :
 //   1. Le rôle admin est revérifié ici à chaque appel via le JWT (jamais un champ envoyé par le
@@ -42,6 +45,7 @@
 //      panneau admin, au lieu du tableau purement local d'avant.
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient, userClient } from "../_shared/supabase.ts";
+import { verifyTransaction } from "../_shared/ikeepay.ts";
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -409,6 +413,56 @@ Deno.serve(async (req) => {
         if (!data) return json({ error: "Ce compte n'est pas suspendu." }, 409);
         await logAudit(svc, user.id, "reactivate_user", userId);
         return json({ user: data });
+      }
+
+      // recheck_ikeepay_payment : audit sécurité du 2026-10-13 — confirmé en production le même
+      // jour : iKeePay peut notifier un paiement réussi par email marchand sans JAMAIS appeler
+      // notre webhook (ikeepay-webhook), laissant la commande bloquée à PENDING indéfiniment.
+      // Cette action permet à un admin de déclencher une revérification RÉELLE serveur-à-serveur
+      // (GET /h2h-verify/:reference, verifyTransaction()) — jamais une confirmation sur la seule
+      // foi d'un email ou d'un clic admin. Réutilise exactement la même logique de traitement
+      // (idempotente) que ikeepay-webhook en cas de succès confirmé.
+      case "recheck_ikeepay_payment": {
+        const paymentId = requireString(body.payment_id, "payment_id");
+        if (typeof paymentId !== "string") return paymentId;
+        const { data: payment, error: payErr } = await svc.from("payments").select("*").eq("id", paymentId).maybeSingle();
+        if (payErr) return dbError("recheck_ikeepay_payment", payErr);
+        if (!payment) return json({ error: "Paiement introuvable." }, 404);
+        if (payment.provider !== "ikeepay") return json({ error: "Cette action ne concerne que les paiements iKeePay." }, 400);
+        if (payment.status === "SUCCESS") return json({ status: "SUCCESS", already: true, message: "Déjà confirmé." });
+        if (!payment.provider_ref) return json({ error: "Référence iKeePay manquante sur ce paiement." }, 500);
+
+        const checked = await verifyTransaction(payment.provider_ref);
+
+        if (checked.status === "completed") {
+          await svc.from("payments").update({ status: "SUCCESS", paid_at: new Date().toISOString(), raw_payload: checked.raw }).eq("id", payment.id);
+          await svc.from("orders").update({ payment_status: "PAID" }).eq("id", payment.order_id);
+          await svc.rpc("create_commissions_for_order", { p_order_id: payment.order_id });
+          const { data: order } = await svc.from("orders").select("product").eq("id", payment.order_id).single();
+          if (order?.product === "card") {
+            const { error: issueErr } = await svc.rpc("issue_card_for_order", { p_order_id: payment.order_id });
+            if (issueErr) console.error("recheck_ikeepay_payment: issue_card_for_order a échoué", issueErr);
+          } else if (order?.product === "topup") {
+            const { error: topupErr } = await svc.rpc("apply_topup_for_order", { p_order_id: payment.order_id });
+            if (topupErr) console.error("recheck_ikeepay_payment: apply_topup_for_order a échoué", topupErr);
+          }
+          await logAudit(svc, user.id, "recheck_ikeepay_payment_success", paymentId);
+          return json({ status: "PAID", message: "Paiement confirmé réellement par iKeePay — commande marquée payée." });
+        }
+        if (checked.status === "failed") {
+          await svc.from("payments").update({ status: "FAILED", raw_payload: checked.raw }).eq("id", payment.id);
+          await svc.from("orders").update({ payment_status: "FAILED" }).eq("id", payment.order_id);
+          await logAudit(svc, user.id, "recheck_ikeepay_payment_failed", paymentId);
+          return json({ status: "FAILED", message: "iKeePay confirme l'échec de ce paiement." });
+        }
+        if (checked.status === "cancelled") {
+          await svc.from("payments").update({ status: "CANCELLED", raw_payload: checked.raw }).eq("id", payment.id);
+          await svc.from("orders").update({ payment_status: "CANCELLED" }).eq("id", payment.order_id);
+          await logAudit(svc, user.id, "recheck_ikeepay_payment_cancelled", paymentId);
+          return json({ status: "CANCELLED", message: "iKeePay confirme l'annulation de ce paiement." });
+        }
+        // "pending"/"unknown" : aucune écriture, on relaie simplement l'état réel actuel.
+        return json({ status: checked.status, message: `iKeePay renvoie le statut '${checked.status}' pour ce paiement — pas encore de confirmation définitive.` });
       }
 
       case "update_settings": {

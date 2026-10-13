@@ -50,6 +50,43 @@ app.use((req, res, next) => {
   next();
 });
 
+// POST /api/webhook — relais vers la vraie fonction serveur (Supabase Edge Function
+// ikeepay-webhook). Ajouté le 13/10/2026 : le support iKeePay a confirmé que l'URL de webhook
+// qu'ils attendent de notre côté est "https://ifriqi.com/api/webhook" (une URL sur notre propre
+// domaine, pas directement l'URL *.supabase.co) — et que c'est précisément l'élément manquant
+// côté configuration, expliquant pourquoi aucun webhook n'était jamais reçu pour les paiements
+// Inline Checkout comme H2H.
+//
+// Ce relais ne fait AUCUNE logique métier : il transmet tel quel (corps brut + en-têtes utiles,
+// notamment X-ikeepay-signature) à la fonction Supabase ikeepay-webhook, qui contient déjà toute
+// la vérification de sécurité (signature HMAC, revérification serveur-à-serveur via
+// GET /h2h-verify avant toute écriture en base — voir ikeepay-webhook/index.ts). On ne duplique
+// jamais cette logique ici : ce serveur Node n'a pas accès aux secrets Supabase/iKeePay.
+//
+// express.raw() est utilisé (pas express.json()) pour transmettre le corps EXACTEMENT comme reçu
+// — une sérialisation JSON intermédiaire casserait une éventuelle vérification de signature
+// calculée sur le corps brut.
+const IKEEPAY_WEBHOOK_TARGET = 'https://opkdvhvnzqzawccrzhxg.supabase.co/functions/v1/ikeepay-webhook';
+app.post('/api/webhook', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+  try {
+    const headers = { 'Content-Type': req.headers['content-type'] || 'application/json' };
+    if (req.headers['x-ikeepay-signature']) headers['x-ikeepay-signature'] = req.headers['x-ikeepay-signature'];
+
+    const upstream = await fetch(IKEEPAY_WEBHOOK_TARGET, {
+      method: 'POST',
+      headers,
+      body: Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {})),
+    });
+    const text = await upstream.text();
+    res.status(upstream.status);
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/json');
+    res.send(text);
+  } catch (e) {
+    console.error('Relais /api/webhook -> ikeepay-webhook a échoué', e);
+    res.status(502).json({ error: 'Relais webhook indisponible.' });
+  }
+});
+
 app.use(express.static(PUBLIC_DIR));
 
 // Default route: the app is a single page.

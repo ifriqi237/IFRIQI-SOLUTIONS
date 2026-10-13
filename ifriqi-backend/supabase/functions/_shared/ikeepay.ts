@@ -71,11 +71,15 @@ export function ikeepayPublicKey(): string | undefined {
 }
 
 export function ikeepayCheckoutUrl(): string {
-  // Valeur par défaut = exactement celle du fichier `Demo.html` officiel fourni par l'utilisateur
-  // (avec "www."). Le plugin WooCommerce officiel utilise une variante sans "www." : les deux
-  // n'ont pas été confirmées équivalentes par le support, donc IKEEPAY_CHECKOUT_URL permet de
-  // basculer sans redéploiement si la valeur par défaut s'avère incorrecte.
-  return Deno.env.get("IKEEPAY_CHECKOUT_URL") || "https://www.ikeepay.com/checkout/v1/inline";
+  // CORRIGÉ le 13/10/2026 : la valeur par défaut était "https://www.ikeepay.com/checkout/v1/inline"
+  // (celle du fichier `Demo.html` fourni initialement), mais un extrait de code iKeePay transmis
+  // par le support/l'utilisateur le même jour utilise explicitement "https://ikeepay.com/..." SANS
+  // "www.". C'est une piste sérieuse pour expliquer le silence des webhooks Inline Checkout
+  // constaté en production (4 paiements confirmés par email mais jamais notifiés) : si "www." et
+  // le domaine nu ne pointent pas vers la même infrastructure côté iKeePay, l'iframe chargeait
+  // potentiellement un point d'entrée différent du vrai backend qui émet les webhooks.
+  // IKEEPAY_CHECKOUT_URL reste disponible pour basculer sans redéploiement si besoin.
+  return Deno.env.get("IKEEPAY_CHECKOUT_URL") || "https://ikeepay.com/checkout/v1/inline";
 }
 
 export function ikeepayInlineConfigured(): boolean {

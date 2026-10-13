@@ -35,8 +35,12 @@ app.use((req, res, next) => {
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "font-src 'self' https://fonts.gstatic.com",
       "img-src 'self' data: blob:",
-      "connect-src 'self' https://opkdvhvnzqzawccrzhxg.supabase.co https://www.ikeepay.com",
-      "frame-src https://www.ikeepay.com",
+      // 13/10/2026 : l'URL Inline Checkout par défaut est passée de "https://www.ikeepay.com/..."
+      // à "https://ikeepay.com/..." (sans "www.", confirmée par le support) — les deux domaines
+      // sont autorisés ici pour ne pas casser le flux selon la valeur réellement utilisée
+      // (IKEEPAY_CHECKOUT_URL peut encore pointer vers l'une ou l'autre).
+      "connect-src 'self' https://opkdvhvnzqzawccrzhxg.supabase.co https://ikeepay.com https://www.ikeepay.com",
+      "frame-src https://ikeepay.com https://www.ikeepay.com",
       "object-src 'none'",
       "base-uri 'self'",
       "frame-ancestors 'none'",

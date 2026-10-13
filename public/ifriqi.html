@@ -440,7 +440,11 @@ const AuthBridge={
       // puis on retente une seule fois — toujours avec le mot de passe fourni, jamais sans
       // revérification.
       try{
-        await callEdgeFunction('auth-auto-confirm',{email});
+        // Audit 2026-10-13 : auth-auto-confirm exige désormais le mot de passe et le
+        // revérifie lui-même côté serveur (ne plus se contenter de la vérification déjà
+        // faite ci-dessus par signInWithPassword, pour qu'un appel direct à cet endpoint
+        // public ne puisse jamais confirmer un compte tiers sans mot de passe valide).
+        await callEdgeFunction('auth-auto-confirm',{email,password});
         ({data,error}=await sb.auth.signInWithPassword({email,password}));
       }catch(e){/* on retombe sur l'erreur d'origine ci-dessous */}
     }

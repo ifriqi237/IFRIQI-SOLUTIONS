@@ -60,8 +60,17 @@ Deno.serve(async (req) => {
 
     const payload = safeJsonParse(rawBody);
     const data = payload?.data ?? payload; // tolère aussi un corps plat (variante "inline checkout" de la doc)
-    const externalReference: string | undefined = data?.external_reference ?? payload?.order_id;
-    const providerReference: string | undefined = data?.provider_reference ?? payload?.ikeepay_ref;
+    // CONFIRMÉ le 14/10/2026 via capture de diagnostic (webhook réel Inline Checkout) : la forme
+    // reçue en production est { event: "payment.success", data: { order_id, amount, currency,
+    // reference, customer_email, status: "completed" } } — différente de la forme documentée
+    // (data.external_reference / data.provider_reference). "order_id" porte en réalité notre
+    // propre externalReference (celui généré côté serveur dans create-order), et "reference" porte
+    // la référence CÔTÉ IKEEPAY (utile pour verifyTransaction, potentiellement différente de celle
+    // qui échoue avec /h2h-verify pour les transactions Inline Checkout). On garde aussi les
+    // anciens noms de champs en repli, au cas où le H2H (mode Direct Charge) utilise une forme
+    // différente de celle de l'Inline Checkout.
+    const externalReference: string | undefined = data?.external_reference ?? data?.order_id ?? payload?.order_id;
+    const providerReference: string | undefined = data?.provider_reference ?? data?.reference ?? payload?.ikeepay_ref;
     if (!externalReference) return json({ error: "external_reference manquant." }, 400);
 
     const svc = serviceClient();

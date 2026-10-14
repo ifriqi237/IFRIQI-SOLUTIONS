@@ -245,22 +245,33 @@ export async function verifyTransaction(reference: string): Promise<IkeepayVerif
 
 export type IkeepaySignatureVerification = { ok: boolean; reason?: string };
 
+// CONFIRMÉ le 14/10/2026 via capture de diagnostic (IKEEPAY_DEBUG_CAPTURE=true, webhook réel
+// reçu sur un paiement Inline Checkout) : contrairement à ce que le support avait annoncé le
+// 12/10 ("HMAC-SHA256"), l'en-tête X-ikeepay-signature ne contient PAS un HMAC calculé sur le
+// corps de la requête. Il contient directement, en clair, la clé secrète du marchand telle que
+// fournie dans IKEEPAY_SECRET_KEY (format "sk_live_..."). Ce n'est donc pas une signature
+// cryptographique du message, mais une authentification par secret partagé statique — on
+// compare simplement l'en-tête reçu à notre propre IKEEPAY_SECRET_KEY, en temps constant pour
+// ne pas exposer d'information via le temps de réponse.
 export async function verifyIkeepayWebhookSignature(req: Request, _rawBody: Uint8Array): Promise<IkeepaySignatureVerification> {
   const sig = req.headers.get("x-ikeepay-signature");
   if (!sig) return { ok: false, reason: "En-tête X-ikeepay-signature absent." };
 
-  // Implémentation réelle à activer dès confirmation du support (secret exact + ce qui est
-  // signé + encodage) :
-  //
-  //   const secret = Deno.env.get("IKEEPAY_WEBHOOK_SECRET")!;
-  //   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret),
-  //     { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  //   const mac = await crypto.subtle.sign("HMAC", key, _rawBody); // ou les champs concaténés
-  //   const expected = toHex(mac); // ou toBase64(mac), selon confirmation
-  //   return timingSafeEqual(expected, sig) ? { ok: true } : { ok: false, reason: "signature invalide" };
+  const secret = Deno.env.get("IKEEPAY_SECRET_KEY");
+  if (!secret) return { ok: false, reason: "IKEEPAY_SECRET_KEY non configurée côté serveur." };
 
-  return {
-    ok: false,
-    reason: "Vérification HMAC non implémentée : secret/champs signés/encodage non confirmés par le support iKeePay.",
-  };
+  return timingSafeEqualStr(sig, secret)
+    ? { ok: true }
+    : { ok: false, reason: "X-ikeepay-signature ne correspond pas à la clé secrète attendue." };
+}
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const maxLen = Math.max(a.length, b.length);
+  let diff = a.length === b.length ? 0 : 1;
+  for (let i = 0; i < maxLen; i++) {
+    const ca = i < a.length ? a.charCodeAt(i) : 0;
+    const cb = i < b.length ? b.charCodeAt(i) : 0;
+    diff |= ca ^ cb;
+  }
+  return diff === 0;
 }

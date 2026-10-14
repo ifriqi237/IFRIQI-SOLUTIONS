@@ -1,26 +1,43 @@
 // POST /ikeepay-webhook — endpoint PUBLIC à renseigner dans le tableau de bord iKeePay comme
-// URL de notification pour les transactions H2H (payin).
+// URL de notification pour les transactions H2H (payin) ET Inline Checkout (payin).
 //
-// Même architecture que pawapay-deposit-callback/index.ts, avec les mêmes principes de
-// sécurité :
-//   1. Vérifie X-ikeepay-signature (HMAC-SHA256) — voir _shared/ikeepay.ts. ⚠️ À ce jour, cette
-//      vérification est TOUJOURS REFUSÉE (fail-safe) car le secret exact / les champs signés /
-//      l'encodage n'ont pas encore été confirmés par le support iKeePay (voir le commentaire
-//      détaillé dans ikeepay.ts). Autrement dit : ce webhook ne validera AUCUN paiement réel en
-//      production tant que ce point n'est pas résolu — c'est volontaire, pas un oubli.
-//      IKEEPAY_REQUIRE_SIGNATURE=false permet de désactiver temporairement cette vérification,
-//      UNIQUEMENT pour tester le reste du flux en sandbox, jamais en production.
-//   2. Ne fait jamais confiance au `status` porté par le corps du webhook : revérifie toujours
-//      via GET /h2h-verify/:reference (verifyTransaction()) avant d'écrire en base.
+// Même architecture que pawapay-deposit-callback/index.ts, avec les principes de sécurité
+// suivants :
+//   1. Vérifie X-ikeepay-signature — voir _shared/ikeepay.ts. CONFIRMÉ le 14/10/2026 via capture
+//      de diagnostic (IKEEPAY_DEBUG_CAPTURE=true, webhook réel) : ce n'est PAS un HMAC (contrairement
+//      à ce que le support avait annoncé le 12/10) mais la clé secrète du marchand (IKEEPAY_SECRET_KEY)
+//      envoyée en clair — vérifiée par comparaison en temps constant. IKEEPAY_REQUIRE_SIGNATURE=false
+//      permet de désactiver temporairement cette vérification, UNIQUEMENT pour tester le reste du
+//      flux en sandbox, jamais en production.
+//   2. Revérification indépendante du `status` porté par le corps du webhook :
+//        - Paiements H2H (payments.method === 'ikeepay') : toujours revérifiés via
+//          GET /h2h-verify/:reference (verifyTransaction()) avant d'écrire en base — règle
+//          inchangée, cet endpoint fonctionne pour ce mode.
+//        - Paiements Inline Checkout (payments.method === 'ikeepay_inline') : EXCEPTION
+//          confirmée explicitement par l'utilisateur le 14/10/2026, après qu'il a été
+//          établi de façon reproductible (deux références différentes testées, dont la
+//          référence iKeePay elle-même) que GET /h2h-verify/:reference renvoie
+//          systématiquement 404 "Requested function was not found" pour ce type de
+//          transaction — la revérification indépendante est donc structurellement
+//          impossible pour ce mode, pas seulement non confirmée. Dans ce cas précis, une
+//          fois la signature authentifiée (étape 1, secret partagé jamais exposé au
+//          navigateur — voir _shared/ikeepay.ts), le `status`/`event` du corps du webhook
+//          est accepté comme preuve suffisante de paiement. Ce choix a été posé explicitement
+//          à l'utilisateur (compromis sécurité documenté) et confirmé par lui : "Oui,
+//          authentifier via signature suffit". Si iKeePay ajoute un jour un endpoint de
+//          vérification couvrant l'Inline Checkout, revenir à la double vérification ici.
 //   3. Idempotence : même index unique payments(provider, provider_ref) où status='SUCCESS'
 //      que pour PawaPay/CinetPay/PayPal (0001_init.sql) — rejouer ce webhook plusieurs fois ne
 //      crée jamais plusieurs cartes/commissions pour la même transaction.
 //   4. Ne rétrograde jamais un paiement déjà PAID (webhook en retard ou désordonné).
 //
-// Forme du webhook attendue, d'après la doc (section "Intégration H2H" → "4. Webhooks") :
+// Forme du webhook H2H attendue d'après la doc (section "Intégration H2H" → "4. Webhooks") :
 //   { event: "transaction.updated"|"transaction.created",
 //     data: { type: "payin"|"payout", external_reference, provider_reference, amount, currency,
 //             country, phone_number, operator, status: "completed"|"pending"|"failed", ... } }
+// Forme du webhook Inline Checkout CONFIRMÉE en production le 14/10/2026 (voir plus bas) :
+//   { event: "payment.success", data: { order_id, amount, currency, reference,
+//             customer_email, status: "completed" } }
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient } from "../_shared/supabase.ts";
 import { verifyIkeepayWebhookSignature, verifyTransaction } from "../_shared/ikeepay.ts";
@@ -86,9 +103,35 @@ Deno.serve(async (req) => {
       return json({ status: "PAID", already: true });
     }
 
-    // Revérification serveur-à-serveur obligatoire : seule cette valeur fait foi, jamais le
-    // `status` du corps du webhook.
-    const checked = await verifyTransaction(providerReference ?? externalReference);
+    // Revérification serveur-à-serveur : par défaut (H2H), seule cette valeur fait foi, jamais
+    // le `status` du corps du webhook. EXCEPTION Inline Checkout (voir commentaire d'en-tête) :
+    // GET /h2h-verify ne couvre pas ce mode (confirmé par deux 404 reproductibles avec des
+    // références différentes) — la signature ayant déjà été authentifiée plus haut, on accepte
+    // directement le statut annoncé par le webhook pour ce mode précis, décision explicitement
+    // confirmée par l'utilisateur le 14/10/2026.
+    const isInlineCheckout = payment.method === "ikeepay_inline";
+    let checked: { status: "completed" | "pending" | "failed" | "cancelled" | "unknown" };
+    if (isInlineCheckout) {
+      const rawStatus = data?.status ?? payload?.status;
+      const eventIsSuccess = payload?.event === "payment.success";
+      const status =
+        rawStatus === "completed" || (eventIsSuccess && !rawStatus)
+          ? "completed"
+          : rawStatus === "failed" || payload?.event === "payment.failed"
+          ? "failed"
+          : rawStatus === "cancelled" || payload?.event === "payment.cancelled"
+          ? "cancelled"
+          : rawStatus === "pending"
+          ? "pending"
+          : "unknown";
+      console.warn(
+        "ikeepay-webhook: paiement Inline Checkout — statut accepté sur la seule foi du webhook signé (h2h-verify non disponible pour ce mode) :",
+        status,
+      );
+      checked = { status };
+    } else {
+      checked = await verifyTransaction(providerReference ?? externalReference);
+    }
 
     if (checked.status === "completed") {
       await svc.from("payments").update({ status: "SUCCESS", paid_at: new Date().toISOString(), raw_payload: payload }).eq("id", payment.id);

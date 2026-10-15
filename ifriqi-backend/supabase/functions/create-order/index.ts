@@ -276,7 +276,21 @@ function initIkeepayInline(displayAmount: number, currency: string, email: strin
   if (!ikeepayInlineConfigured()) {
     return { reference: null, raw: { sandbox: true }, client: { sandbox: true, message: "IKEEPAY_PUBLIC_KEY non configurée : paiement iKeePay (Inline Checkout) indisponible pour le moment." }, skipPayment: true };
   }
-  const reference = crypto.randomUUID();
+  // 2026-10-15 : remplace crypto.randomUUID() (36 caractères) par un identifiant court, sur le
+  // modèle du plugin WooCommerce OFFICIEL d'iKeePay fourni par l'utilisateur, qui utilise
+  // 'ORDER_' + Date.now() (~19 caractères) — voir assets/js/ikeepay-checkout.js de ce plugin.
+  // Signalé le 15/10/2026 : "Metadata field value length must not exceed 64 symbols", renvoyée
+  // par le widget iKeePay LUI-MÊME (jamais par notre serveur — rien ne transite par nos logs)
+  // une fois le formulaire Mobile Money soumis DANS leur iframe, donc visiblement un champ
+  // combiné construit côté iKeePay à partir de ce que l'iframe reçoit en paramètres d'URL
+  // (pk/amount/currency/order_id/email). order_id (notre reference) était de très loin le plus
+  // long de ces champs (UUID v4 = 36 caractères) : le raccourcir est le seul changement sous
+  // notre contrôle qui corresponde à une différence concrète et vérifiable avec l'implémentation
+  // de référence d'iKeePay. Reste unique (horodatage ms + 4 caractères aléatoires en base36) —
+  // aucun contrôle de collision ici, comme pour l'ancien crypto.randomUUID() (risque inchangé,
+  // juste rendu plus court). Cette valeur reste celle stockée dans payments.provider_ref et celle
+  // que le webhook iKeePay renvoie dans data.order_id pour le rapprochement (ikeepay-webhook/index.ts).
+  const reference = "IFR" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
   return {
     reference,
     raw: { mode: "inline_checkout" },

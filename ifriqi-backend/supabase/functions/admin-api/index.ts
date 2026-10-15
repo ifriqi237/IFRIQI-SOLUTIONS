@@ -31,6 +31,16 @@
 //   recheck_ikeepay_payment { payment_id }                      -> revérifie un paiement iKeePay
 //                                                                   PENDING via GET /h2h-verify
 //                                                                   (audit 2026-10-13, voir plus bas)
+//   commissions_report    { country_code?, start_date, end_date, validated_only? }
+//                                                                -> rapport agrégé des commissions
+//                                                                   vendeurs (module Finances →
+//                                                                   Rapports, 2026-10-15, voir plus
+//                                                                   bas)
+//   commissions_report_export_log { country_code?, start_date?, end_date? }
+//                                                                -> journalise un export PDF du
+//                                                                   rapport (aucune donnée lue,
+//                                                                   voir plus bas)
+//   list_countries         {}                                  -> pays configurés (country_currency)
 //
 // Principes de sécurité (mêmes que refund-order/request-withdrawal) :
 //   1. Le rôle admin est revérifié ici à chaque appel via le JWT (jamais un champ envoyé par le
@@ -198,6 +208,108 @@ Deno.serve(async (req) => {
         return json({ commissions: (comms ?? []).map((c) => ({ ...c, distributor: (dists ?? []).find((d) => d.id === c.dist_id) ?? null })) });
       }
 
+      // commissions_report — nouveau module Finances → Rapports commissions vendeurs
+      // (demande du 15/10/2026). Agrège via get_commissions_report() (0009_commissions_report.sql,
+      // lecture seule, service_role uniquement) : jamais de calcul de commission ici, uniquement
+      // de la lecture/agrégation de ce qui existe déjà en base. country_code accepte un code pays
+      // ISO2 (ex. 'CM') ou 'ALL'/absent pour tous les pays. start_date/end_date au format
+      // AAAA-MM-JJ, bornes incluses, interprétées dans le fuseau horaire du pays choisi (table
+      // statique ci-dessous — l'Afrique n'a pas d'heure d'été, donc un décalage fixe suffit) ;
+      // pour 'ALL', on retombe sur UTC (aucun fuseau unique ne serait correct pour tous les pays
+      // à la fois — limite documentée, pas un oubli). validated_only=true restreint aux
+      // commissions déjà au statut 'VALIDATED' (voir commentaire de la fonction SQL : ce statut
+      // n'est atteint par aucun mécanisme actuel de la plateforme, donc ce filtre ne renverra
+      // rien tant qu'une validation manuelle/automatique n'existera pas — fourni par anticipation,
+      // comme demandé). Chaque appel écrit une ligne dans audit_log (consultation d'un rapport
+      // financier sensible), que la recherche aboutisse à un export PDF ou non.
+      case "commissions_report": {
+        const countryCode = typeof body.country_code === "string" && body.country_code && body.country_code !== "ALL"
+          ? body.country_code
+          : null;
+        const startDate = typeof body.start_date === "string" ? body.start_date : null;
+        const endDate = typeof body.end_date === "string" ? body.end_date : null;
+        if (!startDate || !endDate || !/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+          return json({ error: "start_date et end_date sont requis au format AAAA-MM-JJ." }, 400);
+        }
+        const validatedOnly = body.validated_only === true;
+
+        const offsetHours = countryCode ? (COUNTRY_UTC_OFFSET[countryCode] ?? 0) : 0;
+        // Jour civil [00:00:00, 23:59:59.999] dans le fuseau du pays, converti en UTC pour la requête.
+        const startUtc = new Date(`${startDate}T00:00:00.000${formatOffset(offsetHours)}`);
+        const endUtc = new Date(`${endDate}T23:59:59.999${formatOffset(offsetHours)}`);
+        if (isNaN(startUtc.getTime()) || isNaN(endUtc.getTime()) || startUtc > endUtc) {
+          return json({ error: "Période invalide (date de fin avant la date de début ?)." }, 400);
+        }
+
+        const { data: rows, error } = await svc.rpc("get_commissions_report", {
+          p_country_code: countryCode,
+          p_start: startUtc.toISOString(),
+          p_end: endUtc.toISOString(),
+          p_validated_only: validatedOnly,
+        });
+        if (error) return dbError("commissions_report", error);
+
+        const { data: rates } = await svc.from("exchange_rates").select("target_currency,rate,effective_at").order("effective_at", { ascending: false });
+        const rateFor = (cur: string) => (rates ?? []).find((r) => r.target_currency === cur) ?? null;
+
+        const byCurrency = new Map<string, { currency_code: string; total_fcfa: number; converted: number | null; rate: number | null; rate_date: string | null }>();
+        let totalDirect = 0, totalReferral = 0, totalAll = 0;
+        for (const r of (rows ?? [])) {
+          totalDirect += Number(r.direct_fcfa) || 0;
+          totalReferral += Number(r.referral_fcfa) || 0;
+          totalAll += Number(r.total_fcfa) || 0;
+          const cur = r.currency_code || "XAF";
+          const entry = byCurrency.get(cur) ?? { currency_code: cur, total_fcfa: 0, converted: null, rate: null, rate_date: null };
+          entry.total_fcfa += Number(r.total_fcfa) || 0;
+          byCurrency.set(cur, entry);
+        }
+        for (const entry of byCurrency.values()) {
+          const rt = rateFor(entry.currency_code);
+          entry.rate = rt ? Number(rt.rate) : (entry.currency_code === "XAF" ? 1 : null);
+          entry.rate_date = rt?.effective_at ?? null;
+          entry.converted = entry.rate !== null ? Math.round(entry.total_fcfa * entry.rate) : null;
+        }
+
+        await logAudit(
+          svc,
+          user.id,
+          "commissions_report_view",
+          `${countryCode ?? "ALL"}:${startDate}:${endDate}:${validatedOnly ? "validated_only" : "default"}`,
+        );
+
+        return json({
+          rows: rows ?? [],
+          totals: {
+            distributor_count: (rows ?? []).length,
+            direct_fcfa: totalDirect,
+            referral_fcfa: totalReferral,
+            total_fcfa: totalAll,
+            by_currency: [...byCurrency.values()],
+          },
+          meta: {
+            country_code: countryCode ?? "ALL",
+            start_date: startDate,
+            end_date: endDate,
+            validated_only: validatedOnly,
+            generated_at: new Date().toISOString(),
+          },
+        });
+      }
+
+      // commissions_report_export_log — le PDF (§7 du cahier des charges) est généré entièrement
+      // côté client (jsPDF) à partir des données déjà renvoyées par un appel 'commissions_report'
+      // précédent : aucune donnée supplémentaire n'est lue ici. Son seul rôle est d'écrire dans
+      // audit_log que ce rapport a été EXPORTÉ (pas seulement consulté) — exigence explicite du
+      // §10 ("journal d'audit [des] consultations/exports"), distincte de la ligne déjà écrite par
+      // 'commissions_report' à chaque recherche.
+      case "commissions_report_export_log": {
+        const countryCode = typeof body.country_code === "string" && body.country_code ? body.country_code : "ALL";
+        const startDate = typeof body.start_date === "string" ? body.start_date : "";
+        const endDate = typeof body.end_date === "string" ? body.end_date : "";
+        await logAudit(svc, user.id, "commissions_report_export", `${countryCode}:${startDate}:${endDate}`);
+        return json({ ok: true });
+      }
+
       // F-21 (2026-10-11) : l'onglet "Paiements" du panneau admin (distinct de "Ventes", qui lit
       // `orders`) lisait db.payments côté frontend — un tableau jamais alimenté par aucune
       // synchronisation ni aucune écriture locale, donc vide depuis toujours. Les KPIs "Paiements
@@ -326,6 +438,17 @@ Deno.serve(async (req) => {
           .limit(limit);
         if (error) return dbError("list_support", error);
         return json({ messages: data ?? [] });
+      }
+
+      // list_countries — pays effectivement configurés dans IFRIQI (table de référence
+      // country_currency, non sensible), pour alimenter dynamiquement le filtre pays du module
+      // Finances → Rapports commissions vendeurs (demande explicite du cahier des charges
+      // section 3.A : "La liste doit être alimentée dynamiquement à partir des pays effectivement
+      // configurés dans IFRIQI").
+      case "list_countries": {
+        const { data, error } = await svc.from("country_currency").select("country_code,country_name,currency_code").order("country_name", { ascending: true });
+        if (error) return dbError("list_countries", error);
+        return json({ countries: data ?? [] });
       }
 
       case "list_settings": {
@@ -515,6 +638,19 @@ Deno.serve(async (req) => {
     return json({ error: "Une erreur est survenue." }, 500);
   }
 });
+
+// Décalage UTC fixe par pays (Afrique : aucun pays couvert ici n'observe l'heure d'été, un
+// décalage statique est donc fiable) — utilisé uniquement par commissions_report pour borner
+// correctement le "jour civil" d'une période dans le fuseau du pays choisi.
+const COUNTRY_UTC_OFFSET: Record<string, number> = {
+  ZA: 2, BJ: 1, BF: 0, CM: 1, CF: 1, CG: 1, CI: 0, GA: 1, GH: 0,
+  GQ: 1, GW: 0, KE: 3, ML: 0, NE: 1, NG: 1, SN: 0, TD: 1, TG: 0,
+};
+function formatOffset(hours: number): string {
+  const sign = hours >= 0 ? "+" : "-";
+  const h = String(Math.abs(hours)).padStart(2, "0");
+  return `${sign}${h}:00`;
+}
 
 function clampLimit(v: unknown, def: number, max: number): number {
   const n = typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : def;

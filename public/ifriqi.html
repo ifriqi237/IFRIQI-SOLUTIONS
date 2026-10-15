@@ -1526,7 +1526,13 @@ function wizNext(){
 // si l'appel échoue (réseau, PawaPay indisponible...), on retombe sur la saisie libre d'origine
 // plutôt que de bloquer complètement le paiement.
 let ppCache={};
-let payMethodSel='pawapay';
+// 2026-10-15 : PawaPay reste câblé côté backend (create-order, pawapay-deposit-callback,
+// request-withdrawal...) — RIEN n'y est touché, sur demande explicite ("sans bousculer
+// ikeepay") — mais le client ne doit plus pouvoir choisir cette passerelle depuis l'UI,
+// iKeePay étant désormais la seule à fonctionner de façon fiable en production. Le sélecteur
+// pawapay/ikeepay est donc retiré de payUI() ci-dessous ; payMethodSel reste fixé sur
+// 'ikeepay' (setPayMethod() reste défini mais n'est plus jamais appelé par aucun bouton).
+let payMethodSel='ikeepay';
 function setPayMethod(m){payMethodSel=m;render()}
 function ppSync(op){
   if(ppCache[op]!==undefined)return ppCache[op];
@@ -1545,23 +1551,12 @@ function ppField(op,id){
 }
 function payUI(p,kind){
   const top=kind==='topup';
-  const isIk=payMethodSel==='ikeepay';
   return `<h2>${top?tf('pay_recharge_title',{N:EDITS}):t('pay_title')}</h2><div id="err"></div>
   <div class="card" style="background:var(--bg)"><h3 style="margin:0">${top?tf('pay_pack_title',{N:EDITS}):t('pay_card_title')}</h3><p class="muted small" style="margin:6px 0">${top?tf('pay_pack_desc',{N:EDITS}):tf('pay_card_desc',{N:EDITS})}</p><b style="font:800 1.5rem var(--f-head)">${money(PRICE)}</b></div>
   <h3 style="margin-top:18px">${t('pay_method_title')}</h3>
   <p class="small muted" style="margin:0 0 10px">${t('pay_gateway_info')}</p>
-  <label class="f">${t('pay_method_label')}
-    <select id="pay_method_sel" onchange="setPayMethod(this.value)">
-      <option value="pawapay"${!isIk?' selected':''}>${t('pay_method_pawapay')}</option>
-      <option value="ikeepay"${isIk?' selected':''}>${t('pay_method_ikeepay')}</option>
-    </select>
-  </label>
-  ${isIk?`
+  <div class="card" style="background:var(--bg);padding:10px 14px;margin:0 0 10px"><b>${t('pay_method_ikeepay')}</b></div>
   <p class="small muted" style="margin:10px 0">${t('pay_ikeepay_popup_hint')}</p>
-  `:`
-  <label class="f">${t('pay_momo_label')}<input id="pay_phone" type="tel" placeholder="${t('pay_momo_placeholder')}"></label>
-  <label class="f">${t('dist_wd_provider_label')}${ppField('DEPOSIT','pay_provider')}</label>
-  `}
   <div class="row">${!top?'<button class="btn sec" onclick="wizBack()">'+t('back')+'</button>':`<a class="btn sec" href="#/card/${p.id}">${t('wiz_cancel')}</a>`}<button class="btn amber" onclick="doPay('${p.id}','${kind}')">${tf('pay_pay_btn',{AMOUNT:money(PRICE)})}</button></div>`}
 // Modale pop-up iKeePay (Inline Checkout), ajoutée le 2026-10-13 en remplacement (côté front)
 // du flux Direct Charge/H2H — voir _shared/ikeepay.ts côté backend pour le détail de ce choix.

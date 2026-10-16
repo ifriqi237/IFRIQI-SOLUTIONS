@@ -13,6 +13,7 @@ const express = require('express');
 const path = require('path');
 
 const app = express();
+
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -91,6 +92,9 @@ app.post('/api/webhook', express.raw({ type: '*/*', limit: '1mb' }), async (req,
   }
 });
 
+// Les images de /img sont versionnées par ?v=N dans ifriqi.html : cache long immuable côté navigateur
+// (le logo et la photo de la carte modèle ne sont ainsi téléchargés qu'une seule fois).
+app.use('/img', express.static(path.join(PUBLIC_DIR, 'img'), { maxAge: '365d', immutable: true }));
 app.use(express.static(PUBLIC_DIR));
 
 // Default route: the app is a single page.

@@ -1948,14 +1948,10 @@ async function downloadQR(){const d=myDist();await ready();
 
 /* --- pages publiques --- */
 function distLandingView(code){
+  // 2026-10-16 : le lien de parrainage (#/d/CODE) doit afficher EXACTEMENT la même page d'accueil
+  // que ifriqi.com. On conserve uniquement l'attribution (db.ref + trackClick) puis on rend homeView().
   const d=distByCode(code);if(d&&(d.status==='ACTIVE'||d.status==='VERIFICATION')){db.ref={code:d.code,t:Date.now()};trackClick(d);save()}
-  return `<section class="hm-hero" style="padding:44px 0 56px"><div class="wrap hm-grid">
-   <div><span class="hm-eyebrow">${t('home_eyebrow')}</span><h1 style="font-size:clamp(2rem,4.6vw,3.2rem)">${t('dist_landing_h1')}</h1>
-   <p class="hm-lead">${t('dist_landing_lead1')}</p>
-   <p class="hm-lead" style="margin-top:-10px">${t('dist_landing_lead2')}</p>
-   <p style="font:800 1.7rem var(--f-head);margin:0 0 20px">${money(PRICE)} <span style="font:500 1rem var(--f-body);color:#C4D3EF">${t('dist_landing_price_note')}</span></p>
-   <div class="row"><button class="btn amber big" onclick="startCreate()">${t('home_btn_create')}</button><a class="btn ghost big" href="#/demo">${t('home_btn_scan_demo')}</a></div></div>
-   <div class="hm-cardzone">${rectoHtml(DEMO,baseUrl()+'#/demo')}</div></div></section>`}
+  return homeView()}
 function programView(){
   const u=me(),d=myDist(),ca=commAmount(),ca2=commAmount2(),cta=d?`<a class="btn amber big" href="#/distrib">${t('dash_dist_open')}</a>`:(u&&eligible(u.id))?`<button class="btn amber big" onclick="activateDist()">${t('prog_create_link_btn')}</button>`:`<button class="btn amber big" onclick="startCreate()">${t('prog_buy_card_btn')}</button>`;
   const rows=[1,5,10,20,50,100,500,1000].map(n=>`<tr><td>${tf('prog_cards_count',{N:n})}</td><td><b>${money(n*ca)}</b></td></tr>`).join('');

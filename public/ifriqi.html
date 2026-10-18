@@ -1952,7 +1952,22 @@ async function downloadQR(){const d=myDist();await ready();
 function distLandingView(code){
   // 2026-10-16 : le lien de parrainage (#/d/CODE) doit afficher EXACTEMENT la même page d'accueil
   // que ifriqi.com. On conserve uniquement l'attribution (db.ref + trackClick) puis on rend homeView().
-  const d=distByCode(code);if(d&&(d.status==='ACTIVE'||d.status==='VERIFICATION')){db.ref={code:d.code,t:Date.now()};trackClick(d);save()}
+  const c=String(code||'').toUpperCase();
+  // 2026-10-18 : un visiteur anonyme n'a PAS les distributeurs dans sa base locale (distByCode() ne trouve rien),
+  // l'attribution était donc perdue et toutes les commandes partaient avec dist_id = null => aucune commission.
+  // On mémorise le code tout de suite (create-order revalide côté serveur : code existant + ACTIVE), puis on
+  // confirme via la lecture publique 'public code lookup' pour enregistrer le clic ou purger un code invalide.
+  if(/^[A-Z0-9-]{4,20}$/.test(c)){
+    const d=distByCode(c);
+    if(d&&(d.status==='ACTIVE'||d.status==='VERIFICATION')){db.ref={code:d.code,t:Date.now()};trackClick(d);save()}
+    else if(!db.ref||db.ref.code!==c){
+      db.ref={code:c,t:Date.now()};save();
+      try{sb.from('distributors').select('id,code,status').eq('code',c).maybeSingle().then(({data})=>{
+        if(data&&data.status==='ACTIVE'){trackClick({id:data.id,code:data.code})}
+        else if(db.ref&&db.ref.code===c){db.ref=null;save()}
+      }).catch(()=>{})}catch(e){}
+    }
+  }
   return homeView()}
 function programView(){
   const u=me(),d=myDist(),ca=commAmount(),ca2=commAmount2(),cta=d?`<a class="btn amber big" href="#/distrib">${t('dash_dist_open')}</a>`:(u&&eligible(u.id))?`<button class="btn amber big" onclick="activateDist()">${t('prog_create_link_btn')}</button>`:`<button class="btn amber big" onclick="startCreate()">${t('prog_buy_card_btn')}</button>`;

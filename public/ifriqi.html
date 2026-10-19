@@ -398,6 +398,22 @@ function mapAppUser(authUser,row){
 }
 function upsertLocalUser(u){const i=db.users.findIndex(x=>x.id===u.id);if(i>=0)db.users[i]=u;else db.users.push(u)}
 
+
+// Supprime du stockage local tout ce qui appartient à un autre compte que `uid` (ou tout, si uid=null) :
+// profils, cartes, fiches distributeur, commandes, commissions, retraits, registre. Les données réelles
+// sont de toute façon resynchronisées depuis Supabase (RLS) après connexion.
+function purgeForeignLocalData(uid){
+  try{
+    db.users=(db.users||[]).filter(u=>uid&&u.id===uid);
+    db.profiles=(db.profiles||[]).filter(p=>uid&&p.userId===uid);
+    const myDistIds=(db.distributors||[]).filter(d=>uid&&d.userId===uid).map(d=>d.id);
+    db.distributors=(db.distributors||[]).filter(d=>myDistIds.includes(d.id)||(d.status==='ACTIVE'&&false));
+    ['orders','commissions','withdrawals','ledger','notifs'].forEach(k=>{
+      db[k]=(db[k]||[]).filter(r=>uid&&(r.customerId===uid||r.userId===uid||myDistIds.includes(r.distId)));
+    });
+    db.payments=[];
+  }catch(e){}
+}
 const AuthBridge={
   _pendingProfile:null,
   async signUp({email,password,firstName,lastName,phone,country,countryCode}){
@@ -476,11 +492,20 @@ const AuthBridge={
   async signOut(){await sb.auth.signOut()},
   async restoreSession(){
     const {data:{session}}=await sb.auth.getSession();
-    if(!session)return false;
+    // 2026-10-19 : sécurité d'identité. db.session (localStorage) n'est qu'un cache d'affichage ;
+    // la seule preuve d'identité est la session Supabase Auth de CE navigateur. Sans session
+    // Supabase valide, on n'affiche JAMAIS le compte mémorisé localement (sinon un navigateur /
+    // une app installée pourrait afficher le compte de la dernière personne connectée, ou celui
+    // de l'upline). On purge aussi les données locales d'autres comptes.
+    if(!session){
+      if(db.session){db.session=null;purgeForeignLocalData(null);save()}
+      return !!db.session;
+    }
     const authUser=session.user;
     const {data:row}=await sb.from('app_users').select('*').eq('id',authUser.id).maybeSingle();
     if(!row)return false;
     upsertLocalUser(mapAppUser(authUser,row));
+    if(db.session&&db.session!==authUser.id)purgeForeignLocalData(authUser.id);
     db.session=authUser.id;
     // F-15 : resynchronise aussi profils/cartes + fiche distributeur ici, pour qu'un retour sur
     // l'app (session déjà active, ex. après un rechargement de page) voie tout de suite le bon

@@ -421,6 +421,14 @@ const AuthBridge={
     if(error)throw error;
     const authUser=data.user;
     const row={id:authUser.id,first_name:firstName,last_name:lastName,phone,email,country,country_code:countryCode};
+    // Parrain memorise sur le COMPTE (filet de securite serveur si le code n'est pas renvoye a l'achat).
+    // Le serveur l'invalide s'il n'est pas ACTIVE et le rend immuable une fois enregistre.
+    try{
+      if(db.ref&&db.ref.code){
+        const {data:rr}=await sb.from('distributors').select('id,status').eq('code',String(db.ref.code).toUpperCase()).maybeSingle();
+        if(rr&&rr.status==='ACTIVE')row.referred_by_dist=rr.id;
+      }
+    }catch(e){}
     let session=data.session;
     if(!session){
       // Mesure temporaire : "Confirm email" est activé côté projet Supabase mais aucun

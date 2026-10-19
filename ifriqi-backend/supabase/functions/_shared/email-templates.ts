@@ -1,7 +1,7 @@
 // Modèles d'e-mails IFRIQI (présentation uniquement : aucune logique métier ici).
 // Identité : bleu marine #012768, rose magenta #FE4E9A, fond clair #EFF3F9.
 // Aucune donnée médicale ni information sensible : prénom, montant, référence, n° public de carte.
-export type EmailKind = "welcome" | "payment_confirmed" | "test";
+export type EmailKind = "welcome" | "payment_confirmed" | "password_reset" | "test";
 export interface Rendered { subject: string; html: string; text: string }
 
 const NAVY = "#012768", PINK = "#FE4E9A", BG = "#EFF3F9", INK = "#1b2a4a", MUTED = "#5b6b8c";
@@ -72,6 +72,19 @@ export function render(kind: EmailKind, data: Record<string, unknown>, ctx: Ctx)
         ctaLabel: "Ouvrir mon espace", ctaUrl: url, ...ctx,
       }),
       text: `${helloTxt}\n\nNous avons bien reçu votre paiement pour ${what}.\n\n${rows.map((r) => `${r[0]} : ${r[1]}`).join("\n")}\n\nOuvrir mon espace : ${url}${foot}`,
+    };
+  }
+
+  if (kind === "password_reset") {
+    const url = String(data.resetUrl ?? "");
+    return {
+      subject: "Réinitialisation de votre mot de passe IFRIQI",
+      html: layout({
+        preheader: "Choisissez un nouveau mot de passe (lien valable 1 heure).", title: "Réinitialiser votre mot de passe",
+        bodyHtml: `<p>${hello}</p><p>Nous avons reçu une demande de réinitialisation du mot de passe de votre compte IFRIQI. Ce lien est valable <b>1 heure</b> et ne peut servir qu'une seule fois.</p><p style="color:${MUTED};font-size:13px">Si vous n'êtes pas à l'origine de cette demande, ignorez simplement cet e-mail : votre mot de passe actuel reste inchangé. Ne transmettez ce lien à personne.</p>`,
+        ctaLabel: "Choisir un nouveau mot de passe", ctaUrl: url, ...ctx,
+      }),
+      text: `${helloTxt}\n\nNous avons reçu une demande de réinitialisation du mot de passe de votre compte IFRIQI. Ce lien est valable 1 heure et ne peut servir qu'une seule fois :\n${url}\n\nSi vous n'êtes pas à l'origine de cette demande, ignorez cet e-mail : votre mot de passe reste inchangé. Ne transmettez ce lien à personne.${foot}`,
     };
   }
 

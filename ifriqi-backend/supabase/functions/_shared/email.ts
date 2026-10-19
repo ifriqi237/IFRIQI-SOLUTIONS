@@ -30,20 +30,27 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 type Row = { id: string; kind: EmailKind; to_email: string; data: Record<string, unknown>; attempts: number };
 
 /** Met un e-mail en file (idempotent) puis tente l'envoi en arrière-plan. Ne lève jamais. */
-export async function queueEmail(kind: EmailKind, to: string | null | undefined, data: Record<string, unknown>, idempotencyKey: string): Promise<void> {
+export async function queueEmail(kind: EmailKind, to: string | null | undefined, data: Record<string, unknown>, idempotencyKey: string, opts?: { direct?: boolean }): Promise<void> {
   try {
     if (!to || !EMAIL_RE.test(to) || to.length > 254) { console.warn("email: destinataire invalide, ignoré", kind); return; }
     const svc = serviceClient();
-    const { error } = await svc.from("email_outbox").upsert(
-      { idempotency_key: idempotencyKey, kind, to_email: to.toLowerCase(), data },
-      { onConflict: "idempotency_key", ignoreDuplicates: true },
-    );
+    // direct=true (liens sensibles : réinitialisation de mot de passe) : la ligne est créée déjà
+    // « verrouillée » pour 24 h et envoyée immédiatement, sans nouvelle tentative différée. En cas
+    // d'échec elle passe en "dead" (jeton effacé) : l'utilisateur redemande un lien. Aucune autre
+    // instance de drain ne la reprend, donc le jeton ne reste jamais en attente dans la file.
+    const direct = opts?.direct === true;
+    const row = { idempotency_key: idempotencyKey, kind, to_email: to.toLowerCase(), data,
+      ...(direct ? { status: "sending", locked_at: new Date(Date.now() + 24 * 3600_000).toISOString() } : {}) };
+    const { data: ins, error } = await svc.from("email_outbox").upsert(row,
+      { onConflict: "idempotency_key", ignoreDuplicates: true }).select("id,kind,to_email,data,attempts");
     if (error) { console.error("email: mise en file impossible", error.message); return; }
     // Envoi en arrière-plan : n'allonge pas la réponse du webhook.
-    const job = drainOutbox(5).catch((e) => console.error("email: drain", String(e?.message ?? e)));
+    const job = direct
+      ? (ins?.[0] ? sendRow(ins[0] as unknown as Row, emailConfig()).then(() => {}) : Promise.resolve()).catch((e) => console.error("email: envoi direct", String(e?.message ?? e)))
+      : drainOutbox(5).catch((e) => console.error("email: drain", String(e?.message ?? e)));
     // deno-lint-ignore no-explicit-any
     const rt = (globalThis as any).EdgeRuntime;
-    if (rt?.waitUntil) rt.waitUntil(job);
+    if (rt?.waitUntil) rt.waitUntil(job); else await job;
   } catch (e) {
     console.error("email: queueEmail", String((e as Error)?.message ?? e));
   }
@@ -75,6 +82,7 @@ export async function drainOutbox(limit = 10): Promise<{ sent: number; failed: n
 
 async function sendRow(row: Row, cfg: ReturnType<typeof emailConfig>): Promise<"sent" | "failed" | "skipped"> {
   const svc = serviceClient();
+  if (!cfg.apiKey && row.kind === "password_reset") { await fail(row.id, row.attempts + 1, "RESEND_API_KEY non configurée", true, row.kind); return "failed"; }
   if (!cfg.apiKey) {
     // Clé absente : on remet en attente SANS consommer de tentative (l'e-mail partira dès que la clé sera posée).
     await svc.from("email_outbox").update({ status: "pending", locked_at: null, last_error: "RESEND_API_KEY non configurée", next_attempt_at: new Date(Date.now() + 5 * 60_000).toISOString() }).eq("id", row.id);
@@ -97,24 +105,24 @@ async function sendRow(row: Row, cfg: ReturnType<typeof emailConfig>): Promise<"
     } finally { clearTimeout(timer); }
     const body = await res.json().catch(() => ({}));
     if (res.ok && body?.id) {
-      await svc.from("email_outbox").update({ status: "sent", attempts, provider_id: body.id, sent_at: new Date().toISOString(), locked_at: null, last_error: null }).eq("id", row.id);
+      await svc.from("email_outbox").update({ status: "sent", attempts, provider_id: body.id, sent_at: new Date().toISOString(), locked_at: null, last_error: null, ...(row.kind === "password_reset" ? { data: {} } : {}) }).eq("id", row.id);
       return "sent";
     }
     const msg = `HTTP ${res.status} ${String(body?.name ?? "")} ${String(body?.message ?? "")}`.trim().slice(0, 300);
     // 4xx hors 429 = erreur définitive (domaine, adresse, clé invalide...) : inutile de réessayer 5 fois.
     const permanent = res.status >= 400 && res.status < 500 && res.status !== 429 && res.status !== 408;
-    await fail(row.id, attempts, msg, permanent);
+    await fail(row.id, attempts, msg, permanent, row.kind);
     return "failed";
   } catch (e) {
-    await fail(row.id, attempts, `réseau/timeout: ${String((e as Error)?.name ?? "erreur")}`, false);
+    await fail(row.id, attempts, `réseau/timeout: ${String((e as Error)?.name ?? "erreur")}`, false, row.kind);
     return "failed";
   }
 }
 
-async function fail(id: string, attempts: number, msg: string, permanent: boolean) {
-  const dead = permanent || attempts >= MAX_ATTEMPTS;
+async function fail(id: string, attempts: number, msg: string, permanent: boolean, kind?: string) {
+  const dead = permanent || attempts >= MAX_ATTEMPTS || kind === "password_reset";
   const next = new Date(Date.now() + BACKOFF_MIN[Math.min(attempts - 1, BACKOFF_MIN.length - 1)] * 60_000).toISOString();
-  await serviceClient().from("email_outbox").update({ status: dead ? "dead" : "failed", attempts, last_error: msg, locked_at: null, next_attempt_at: next }).eq("id", id);
+  await serviceClient().from("email_outbox").update({ status: dead ? "dead" : "failed", attempts, last_error: msg, locked_at: null, next_attempt_at: next, ...(dead && kind === "password_reset" ? { data: {} } : {}) }).eq("id", id);
   console.error(`email: échec ${dead ? "définitif" : "temporaire"} (tentative ${attempts}) — ${msg}`);
 }
 

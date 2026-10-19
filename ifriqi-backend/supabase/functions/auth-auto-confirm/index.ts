@@ -32,6 +32,7 @@
 // réelles.
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient } from "../_shared/supabase.ts";
+import { notifyWelcome } from "../_shared/email.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
 Deno.serve(async (req) => {
@@ -81,6 +82,9 @@ Deno.serve(async (req) => {
       console.error("auth-auto-confirm: updateUserById a échoué", error);
       return json({ error: "Impossible de confirmer ce compte pour le moment." }, 500);
     }
+    // E-mail de bienvenue : uniquement au chemin « inscription » (user_id), jamais au chemin de réparation
+    // par mot de passe (comptes anciens). Idempotent (clé welcome:<user_id>), ne lève jamais.
+    if (typeof user_id === "string") await notifyWelcome(uid);
     return json({ confirmed: true });
   } catch (e) {
     console.error("auth-auto-confirm error", e);

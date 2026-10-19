@@ -41,6 +41,7 @@
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient } from "../_shared/supabase.ts";
 import { verifyIkeepayWebhookSignature, verifyTransaction } from "../_shared/ikeepay.ts";
+import { notifyPaymentConfirmed } from "../_shared/email.ts";
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -146,6 +147,9 @@ Deno.serve(async (req) => {
         const { error: topupErr } = await svc.rpc("apply_topup_for_order", { p_order_id: payment.order_id });
         if (topupErr) console.error("apply_topup_for_order failed from ikeepay-webhook", topupErr);
       }
+      // E-mail de confirmation : paiement validé côté serveur (webhook authentifié) uniquement. Ne lève jamais :
+      // un échec d'e-mail n'a aucun effet sur l'état du paiement/de la commande déjà écrit ci-dessus.
+      await notifyPaymentConfirmed(payment.order_id);
       return json({ status: "PAID" });
     }
 

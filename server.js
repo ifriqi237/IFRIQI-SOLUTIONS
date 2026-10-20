@@ -41,7 +41,10 @@ app.use((req, res, next) => {
       // sont autorisés ici pour ne pas casser le flux selon la valeur réellement utilisée
       // (IKEEPAY_CHECKOUT_URL peut encore pointer vers l'une ou l'autre).
       "connect-src 'self' https://opkdvhvnzqzawccrzhxg.supabase.co https://ikeepay.com https://www.ikeepay.com",
-      "frame-src https://ikeepay.com https://www.ikeepay.com",
+      // 20/10/2026 : un client en Cote d'Ivoire voyait une icone de page cassee (iframe bloquee) en choisissant
+      // Wave dans la fenetre iKeePay : l'iframe iKeePay redirige vers le domaine de Wave, que frame-src
+      // interdisait. On autorise donc les sous-domaines iKeePay et Wave (rien d'autre n'est ouvert).
+      "frame-src https://ikeepay.com https://*.ikeepay.com https://wave.com https://*.wave.com",
       "object-src 'none'",
       "base-uri 'self'",
       "frame-ancestors 'none'",

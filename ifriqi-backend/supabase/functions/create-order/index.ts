@@ -8,6 +8,7 @@
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient, userClient } from "../_shared/supabase.ts";
 import { initiateDeposit, getActiveConfiguration } from "../_shared/pawapay.ts";
+import { paylivConfigured, PAYLIV_COUNTRIES, PAYLIV_MIN, normalizePhone, createMobileMoney, extractRedirect } from "../_shared/payliv.ts";
 import { initiatePayin as ikeepayInitiatePayin, ikeepayConfigured, ikeepayPublicKey, ikeepayCheckoutUrl, ikeepayInlineConfigured } from "../_shared/ikeepay.ts";
 
 Deno.serve(async (req) => {
@@ -21,11 +22,12 @@ Deno.serve(async (req) => {
     }
 
     const body = await req.json();
-    const { profileId, product, refCode, method, phone, pawapayProvider, ikeepayOperator, ikeepayCountry } = body as {
+    const { profileId, product, refCode, method, phone, pawapayProvider, ikeepayOperator, ikeepayCountry, paylivProvider } = body as {
       profileId: string; product: "card" | "topup"; refCode?: string; method: string; phone?: string;
       pawapayProvider?: string; // requis si method === 'pawapay' — code fournisseur PawaPay, ex. "MTN_MOMO_BEN"
       ikeepayOperator?: string; // requis si method === 'ikeepay' (Direct Charge/H2H) — ex. "ORANGE", "MTN", "WAVE"...
       ikeepayCountry?: string;  // requis si method === 'ikeepay' (Direct Charge/H2H) — code pays ISO2, ex. "CI"
+      paylivProvider?: string;  // requis si method === 'payliv_momo' — ex. "mtn", "orange", "wave"
     };
     if (!profileId || !["card", "topup"].includes(product)) {
       return json({ error: "profileId et product ('card'|'topup') sont requis." }, 400);
@@ -68,6 +70,25 @@ Deno.serve(async (req) => {
     const rate = rateRow?.rate ?? 1;
     const displayAmount = Math.round(priceFcfa * rate * 100) / 100;
 
+    // ---- PAYLIV Mobile Money : validations AVANT de créer la commande (aucune commande orpheline) ----
+    // Le pays de l'acheteur (profil serveur, pas le navigateur) fixe le pays/la devise PAYLIV.
+    let paylivCountry = "";
+    let paylivPhone = "";
+    if (method === "payliv_momo") {
+      const pm = (settings!.payment_methods ?? {}) as Record<string, unknown>;
+      if (pm.payliv_momo !== true) return json({ error: "Ce moyen de paiement n'est pas encore disponible." }, 403);
+      if (!paylivConfigured()) return json({ error: "Ce moyen de paiement n'est pas encore disponible." }, 503);
+      paylivCountry = String(buyer?.country_code ?? "").toUpperCase();
+      const pc = PAYLIV_COUNTRIES[paylivCountry];
+      if (!pc) return json({ error: "Le Mobile Money PAYLIV n'est pas disponible dans votre pays." }, 422);
+      if (pc.currency !== currency) return json({ error: "Devise non prise en charge pour ce pays." }, 422);
+      if (!paylivProvider || !pc.providers.includes(paylivProvider)) return json({ error: "Opérateur Mobile Money invalide pour votre pays." }, 422);
+      const np = normalizePhone(phone ?? "", paylivCountry);
+      if (!np) return json({ error: "Numéro de téléphone invalide pour votre pays." }, 422);
+      paylivPhone = np;
+      if (displayAmount < (PAYLIV_MIN[currency] ?? 0)) return json({ error: "Montant inférieur au minimum de l'opérateur." }, 422);
+    }
+
     const { data: order, error: orderErr } = await svc.from("orders").insert({
       customer_id: user.id,
       profile_id: profileId,
@@ -82,8 +103,10 @@ Deno.serve(async (req) => {
     if (orderErr) { console.error("create-order insert error", orderErr); return json({ error: "Impossible de créer la commande pour le moment." }, 500); }
 
     // ---- Initiation du paiement chez le prestataire ----
-    const provider = method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : (method === "ikeepay" || method === "ikeepay_inline") ? "ikeepay" : "cinetpay";
-    const init = provider === "paypal"
+    const provider = method === "payliv_momo" ? "payliv" : method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : (method === "ikeepay" || method === "ikeepay_inline") ? "ikeepay" : "cinetpay";
+    const init = provider === "payliv"
+      ? await initPayliv(order.id, displayAmount, currency, paylivCountry, paylivPhone, paylivProvider!)
+      : provider === "paypal"
       ? await initPaypal(order.id, priceFcfa)
       : provider === "pawapay"
       ? await initPawapay(order.id, displayAmount, currency, phone!, pawapayProvider!)
@@ -272,6 +295,45 @@ async function initIkeepay(orderId: string, displayAmount: number, currency: str
 // faut pour ouvrir cette iframe. Nécessite IKEEPAY_PUBLIC_KEY (distincte de IKEEPAY_SECRET_KEY,
 // qui ne doit jamais quitter le serveur).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// PAYLIV Mobile Money (ajouté le 2026-10-21) — voir _shared/payliv.ts.
+// Le montant vient de settings.price_fcfa converti côté serveur (displayAmount). fee_bearer=client :
+// l'acheteur paie les frais PAYLIV EN PLUS (le prix enregistré de la commande ne change pas).
+// payments.provider_ref = payment_id PAYLIV ; notre numéro de commande part dans metadata.orderId.
+// ---------------------------------------------------------------------------
+async function initPayliv(orderId: string, displayAmount: number, currency: string, country: string, phone: string, provider: string) {
+  const r = await createMobileMoney({
+    amount: displayAmount, currency, phone, country, provider,
+    title: "Carte de secours IFRIQI",
+    webhookUrl: (Deno.env.get("SUPABASE_URL") ?? "") + "/functions/v1/payliv-webhook",
+    metadata: { orderId },
+  });
+  if (!r.ok) {
+    return { reference: null, raw: { error: r.code }, client: { error: r.message }, skipPayment: true };
+  }
+  const d = r.data;
+  const paymentId = String(d.payment_id ?? d.id ?? "");
+  if (!paymentId) return { reference: null, raw: { error: "NO_PAYMENT_ID" }, client: { error: "Réponse inattendue du prestataire de paiement." }, skipPayment: true };
+  const na = d.next_action;
+  const instructions = (d.confirmation_instructions ?? d.otp_instructions ?? d.instructions ?? null) as string | null;
+  const exp = (d.confirmation_expires_at as string | undefined) ??
+    new Date(Date.now() + ((typeof d.expires_in === "number" ? d.expires_in : 1800) * 1000)).toISOString();
+  return {
+    reference: paymentId,
+    raw: { created: d },
+    client: {
+      paylivPaymentId: paymentId,
+      paylivInstructions: instructions,
+      paylivRequiresOtp: d.requires_otp === true || na === "submit_otp" || d.status === "awaiting_otp",
+      paylivRedirectUrl: extractRedirect(d),
+      paylivExpiresAt: exp,
+      paylivChargedAmount: typeof d.charged_amount === "number" ? d.charged_amount : null,
+      paylivFees: typeof d.fees === "number" ? d.fees : null,
+      paylivCurrency: currency,
+    },
+  };
+}
+
 function initIkeepayInline(displayAmount: number, currency: string, email: string) {
   if (!ikeepayInlineConfigured()) {
     return { reference: null, raw: { sandbox: true }, client: { sandbox: true, message: "IKEEPAY_PUBLIC_KEY non configurée : paiement iKeePay (Inline Checkout) indisponible pour le moment." }, skipPayment: true };

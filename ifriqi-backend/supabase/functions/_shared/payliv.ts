@@ -110,6 +110,23 @@ export function createMobileMoney(p: {
   });
 }
 
+/** Carte bancaire Visa/Mastercard (doc « API Paiement par carte ») : page hébergée PAYLIV + 3-D Secure.
+ *  Réponse : { payment_id, reference, status:"pending", checkout_url, ... }. Pas de fee_bearer documenté
+ *  pour la carte : le montant demandé est celui facturé, les frais éventuels restent à la charge du marchand. */
+export function createCard(p: {
+  amount: number; currency: string; country: string; title: string; email: string; name?: string;
+  successUrl: string; cancelUrl: string; webhookUrl: string; metadata: Record<string, unknown>;
+}) {
+  return call("/api-payments-card", {
+    method: "POST",
+    body: JSON.stringify({
+      amount: p.amount, currency: p.currency, country: p.country, title: p.title,
+      customer_email: p.email, ...(p.name ? { customer_name: p.name } : {}),
+      success_url: p.successUrl, cancel_url: p.cancelUrl, webhook_url: p.webhookUrl, metadata: p.metadata,
+    }),
+  });
+}
+
 export function getStatus(paymentId: string) {
   return call("/api-payments-status?payment_id=" + encodeURIComponent(paymentId), { method: "GET" });
 }

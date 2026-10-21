@@ -8,7 +8,7 @@
 import { corsHeaders } from "../_shared/cors.ts";
 import { serviceClient, userClient } from "../_shared/supabase.ts";
 import { initiateDeposit, getActiveConfiguration } from "../_shared/pawapay.ts";
-import { paylivConfigured, PAYLIV_COUNTRIES, PAYLIV_MIN, normalizePhone, createMobileMoney, extractRedirect } from "../_shared/payliv.ts";
+import { paylivConfigured, PAYLIV_COUNTRIES, PAYLIV_MIN, normalizePhone, createMobileMoney, createCard, extractRedirect } from "../_shared/payliv.ts";
 import { initiatePayin as ikeepayInitiatePayin, ikeepayConfigured, ikeepayPublicKey, ikeepayCheckoutUrl, ikeepayInlineConfigured } from "../_shared/ikeepay.ts";
 
 Deno.serve(async (req) => {
@@ -89,6 +89,17 @@ Deno.serve(async (req) => {
       if (displayAmount < (PAYLIV_MIN[currency] ?? 0)) return json({ error: "Montant inférieur au minimum de l'opérateur." }, 422);
     }
 
+    // ---- PAYLIV carte bancaire (Visa/Mastercard, page hébergée + 3DS) : mêmes principes ----
+    let cardCountry = "";
+    if (method === "payliv_card") {
+      const pm = (settings!.payment_methods ?? {}) as Record<string, unknown>;
+      if (pm.payliv_card !== true || !paylivConfigured()) return json({ error: "Ce moyen de paiement n'est pas encore disponible." }, 403);
+      cardCountry = String(buyer?.country_code ?? "").toUpperCase();
+      if (!cc || !cardCountry) return json({ error: "Votre pays n'est pas pris en charge pour le paiement par carte." }, 422);
+      if (!user.email) return json({ error: "Une adresse e-mail est requise pour le paiement par carte." }, 422);
+      if (displayAmount < (PAYLIV_MIN[currency] ?? 0)) return json({ error: "Montant inférieur au minimum accepté." }, 422);
+    }
+
     const { data: order, error: orderErr } = await svc.from("orders").insert({
       customer_id: user.id,
       profile_id: profileId,
@@ -103,9 +114,11 @@ Deno.serve(async (req) => {
     if (orderErr) { console.error("create-order insert error", orderErr); return json({ error: "Impossible de créer la commande pour le moment." }, 500); }
 
     // ---- Initiation du paiement chez le prestataire ----
-    const provider = method === "payliv_momo" ? "payliv" : method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : (method === "ikeepay" || method === "ikeepay_inline") ? "ikeepay" : "cinetpay";
+    const provider = (method === "payliv_momo" || method === "payliv_card") ? "payliv" : method === "paypal" ? "paypal" : method === "pawapay" ? "pawapay" : (method === "ikeepay" || method === "ikeepay_inline") ? "ikeepay" : "cinetpay";
     const init = provider === "payliv"
-      ? await initPayliv(order.id, displayAmount, currency, paylivCountry, paylivPhone, paylivProvider!)
+      ? (method === "payliv_card"
+          ? await initPaylivCard(order.id, displayAmount, currency, cardCountry, user.email ?? "")
+          : await initPayliv(order.id, displayAmount, currency, paylivCountry, paylivPhone, paylivProvider!))
       : provider === "paypal"
       ? await initPaypal(order.id, priceFcfa)
       : provider === "pawapay"
@@ -285,6 +298,26 @@ async function initIkeepay(orderId: string, displayAmount: number, currency: str
 }
 
 // ---------------------------------------------------------------------------
+// PAYLIV carte bancaire : le serveur crée le paiement, le navigateur est redirigé vers checkout_url (page PAYLIV 3DS).
+// Les adresses de retour contiennent notre numéro de commande ; elles ne prouvent JAMAIS le paiement (le webhook signé + la
+// relecture du statut chez PAYLIV font foi, voir payliv-settle.ts).
+async function initPaylivCard(orderId: string, displayAmount: number, currency: string, country: string, email: string) {
+  const base = (Deno.env.get("PUBLIC_APP_URL") || "https://ifriqi.com").replace(/\/+$/, "");
+  const r = await createCard({
+    amount: displayAmount, currency, country, title: "Carte de secours IFRIQI", email,
+    successUrl: `${base}/#/payreturn/${orderId}`,
+    cancelUrl: `${base}/#/paycancel/${orderId}`,
+    webhookUrl: (Deno.env.get("SUPABASE_URL") ?? "") + "/functions/v1/payliv-webhook",
+    metadata: { orderId },
+  });
+  if (!r.ok) return { reference: null, raw: { error: r.code }, client: { error: r.message }, skipPayment: true };
+  const d = r.data;
+  const paymentId = String(d.payment_id ?? d.id ?? "");
+  const url = extractRedirect(d);
+  if (!paymentId || !url) return { reference: null, raw: { error: "NO_CHECKOUT" }, client: { error: "Réponse inattendue du prestataire de paiement." }, skipPayment: true };
+  return { reference: paymentId, raw: { created: d }, client: { paylivPaymentId: paymentId, paylivCheckoutUrl: url } };
+}
+
 // iKeePay — Inline Checkout (modale pop-up), ajouté le 2026-10-13. Mode ACTIF côté front en
 // attendant le déblocage du palier Direct Charge/PRO (voir commentaire détaillé dans
 // _shared/ikeepay.ts : ikeepayPublicKey()/ikeepayCheckoutUrl()).

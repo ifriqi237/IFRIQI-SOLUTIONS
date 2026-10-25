@@ -37,9 +37,19 @@ export async function settlePayliv(svc: Svc, payment: Record<string, any>): Prom
   const verdict = classifyStatus(r);
   const failureClass = (r.failure_class as string) ?? ((r.latest_attempt as Record<string, unknown> | undefined)?.failure_class as string) ?? null;
 
-  // Le statut distant doit concerner CE paiement.
-  const remoteId = String(r.id ?? r.payment_id ?? paymentId);
-  if (remoteId !== paymentId) { console.error("payliv-settle: identifiant de paiement incohérent", paymentId, remoteId); return { status: "PENDING", reason: "id_mismatch" }; }
+  // Le statut distant doit concerner CE paiement. Constat du 2026-10-25 (premier essai réel) : /api-payments-status
+  // renvoie dans `id` un identifiant INTERNE différent du `payment_id` donné à la création -> l'ancien test sur `id`
+  // bloquait toute confirmation. Règle : `payment_id` s'il est présent doit être le nôtre ; sinon notre numéro de commande
+  // dans metadata.orderId ; à défaut, la lecture a été faite par notre identifiant exact avec la clé secrète, et le
+  // statut, la devise et le montant sont contrôlés plus bas. Les NOMS des champs reçus sont journalisés (jamais leurs valeurs).
+  const rMeta = r.metadata && typeof r.metadata === "object" ? (r.metadata as Record<string, unknown>) : null;
+  if (r.payment_id != null && String(r.payment_id) !== paymentId) {
+    console.error("payliv-settle: identifiant de paiement incohérent", paymentId, String(r.payment_id)); return { status: "PENDING", reason: "id_mismatch" };
+  }
+  if (r.payment_id == null && rMeta?.orderId != null && String(rMeta.orderId) !== String(order.id)) {
+    console.error("payliv-settle: commande incohérente dans metadata", order.id); return { status: "PENDING", reason: "id_mismatch" };
+  }
+  if (r.payment_id == null && rMeta?.orderId == null) console.warn("payliv-settle: statut sans payment_id ni metadata.orderId ; champs :", Object.keys(r).join(","));
 
   if (verdict === "paid") {
     // Devise et montant : le montant doit être le prix de la commande (ou le total facturé avec frais

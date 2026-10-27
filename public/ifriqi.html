@@ -866,7 +866,7 @@ function newPublicId(){db.counter=(db.counter||0)+1;const d=new Date();return 'I
 /* ---------- Base de données locale ---------- */
 let mem=null;
 const PAY_METHODS=[{id:'momo',label:'Mobile Money',sub:'MTN, Orange Money et autres opérateurs',phone:true},{id:'card',label:'Carte bancaire',sub:'Visa, Mastercard…',phone:false},{id:'paypal',label:'PayPal',sub:'Compte PayPal',phone:false},{id:'other',label:'Autres moyens',sub:'Selon la passerelle de paiement retenue',phone:false},{id:'payliv_momo',label:'PAYLIV Mobile Money',sub:'Tous pays pris en charge — visible par les acheteurs seulement si activé',phone:false},{id:'payliv_card',label:'PAYLIV Carte bancaire',sub:'Visa / Mastercard (page securisee PAYLIV) — visible seulement si activé',phone:false}];
-function defSettings(){return {methods:{momo:1,card:1,paypal:1,other:0},price:1000,commL1:250,commL2:100,minWithdraw:5000,validationDays:7,payoutMethods:{momo:1,bank:0,paypal:0,other:0},msgOffer:"Faites connaître IFRIQI autour de vous : {L1} FCFA sur chaque carte vendue directement via votre lien, {L2} FCFA supplémentaires quand une personne que vous avez parrainée vend elle-même une carte (2 niveaux, jamais plus).",msgShare:"Fais ta carte aujourd'hui, car on ne sait jamais. Clique sur le lien, en 5 minutes ta carte de secours est disponible. Recommande à tes proches. {LIEN}",msgDash:''}}
+function defSettings(){return {methods:{momo:1,card:1,paypal:1,other:0},price:1000,commL1:500,commL2:100,minWithdraw:5000,validationDays:7,payoutMethods:{momo:1,bank:0,paypal:0,other:0},msgOffer:"Faites connaître IFRIQI autour de vous : {L1} FCFA sur chaque carte vendue directement via votre lien, {L2} FCFA supplémentaires quand une personne que vous avez parrainée vend elle-même une carte (2 niveaux, jamais plus).",msgShare:"Fais ta carte aujourd'hui, car on ne sait jamais. Clique sur le lien, en 5 minutes ta carte de secours est disponible. Recommande à tes proches. {LIEN}",msgDash:''}}
 function ensureDb(){['distributors','clicks','orders','commissions','withdrawals','ledger','notifs'].forEach(k=>{if(!db[k])db[k]=[]});if(!db.orderSeq)db.orderSeq=0;const d=defSettings(),s0=db.settings||{};db.settings=Object.assign({},d,s0);db.settings.methods=Object.assign({},d.methods,s0.methods||{});db.settings.payoutMethods=Object.assign({},d.payoutMethods,s0.payoutMethods||{});PRICE=db.settings.price||1000}
 function blank(){return {users:[],profiles:[],payments:[],scans:[],audit:[],support:[],session:null,settings:defSettings()}}
 function load(){try{const r=localStorage.getItem(KEY)||localStorage.getItem('ifricard_db_v1')||localStorage.getItem(OLDKEY);if(r)return JSON.parse(r)}catch(e){}return mem||blank()}
@@ -2776,8 +2776,22 @@ async function installApp(){
   toast(t('install_fallback_hint'));
 }
 if('serviceWorker' in navigator){try{navigator.serviceWorker.register('/sw.js')}catch(e){}}
+// 2026-10-27 : les montants de commission (niveau 1 / niveau 2) n'etaient relus depuis la base que dans le panneau admin
+// (syncAdminSettings) ; pour tous les autres, le navigateur gardait sa valeur locale (250/100 par defaut), donc un
+// changement de commission en base n'apparaissait jamais pour les visiteurs ni les vendeurs. On relit ici la valeur
+// serveur (lecture publique, colonnes de commission uniquement) ; aucun autre reglage n'est touche.
+async function syncPublicCommissions(){
+  try{
+    const {data}=await sb.from('settings').select('comm_l1_fcfa,comm_l2_fcfa').eq('id',1).maybeSingle();
+    if(!data)return;
+    let ch=false;
+    [['commL1','comm_l1_fcfa'],['commL2','comm_l2_fcfa']].forEach(([k,c])=>{const v=data[c];if(Number.isInteger(v)&&v>0&&db.settings[k]!==v){db.settings[k]=v;ch=true}});
+    if(ch){save();render()}
+  }catch(e){}
+}
 const assetsP=ready();
 render();
+syncPublicCommissions();
 assetsP.then(()=>{cardCache.clear();refreshCards()});
 // Restaure une session Supabase réelle existante (ex. retour sur le site après
 // connexion). Volontairement APRÈS le premier render() : le prototype garde son
